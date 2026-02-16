@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  vault:
+    build: ./vault
+    container_name: vault
+    environment:
+      - VAULT_PASSWORD=${VAULT_PASSWORD:-change-me-in-production}
+    volumes:
+      - ./vault/secrets:/vault
+    networks:
+      - securebot
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8200/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  gateway:
+    build: ./gateway
+    container_name: gateway
+    environment:
+      - VAULT_URL=http://vault:8200
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - OLLAMA_MODEL=phi4-mini:3.8b
+    volumes:
+      - /home/tasker0/securebot/skills:/home/tasker0/securebot/skills
+    networks:
+      - securebot
+    ports:
+      - "8080:8080"
+    depends_on:
+      - vault
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  securebot:
+    driver: bridge

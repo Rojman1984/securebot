@@ -1,0 +1,34 @@
+# Secrets - NEVER COMMIT THESE
+vault/secrets/secrets.json
+*.key
+*.pem
+.env
+
+# User data
+data/
+memory.db
+workspaces/
+gitea-data/
+
+# Docker
+docker-compose.override.yml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
