@@ -1,0 +1,31 @@
+{
+  "active_task": {
+    "id": "task_001",
+    "title": "Set up SecureBot",
+    "description": "Initial SecureBot installation and configuration",
+    "priority": "high",
+    "created": "YYYY-MM-DD",
+    "status": "in_progress"
+  },
+  "todo": [
+    {
+      "id": "task_002",
+      "title": "Configure search providers",
+      "priority": "high",
+      "status": "pending"
+    },
+    {
+      "id": "task_003",
+      "title": "Set up Telegram bot skill",
+      "priority": "medium",
+      "status": "pending"
+    },
+    {
+      "id": "task_004",
+      "title": "Customize soul.md",
+      "priority": "low",
+      "status": "pending"
+    }
+  ],
+  "completed": []
+}

@@ -32,3 +32,32 @@ Thumbs.db
 *.tmp
 *.swp
 *~
+.claude-work/
+
+# Memory - Personal files (NEVER commit)
+memory/soul.md
+memory/user.md
+memory/session.md
+memory/tasks.json
+memory/heartbeat.log
+memory/hourly.log
+memory/daily.log
+memory/archive/
+
+# Keep templates (safe to commit)
+!memory/templates/
+!memory/README.md
+
+# Memory - Personal files (NEVER commit)
+memory/soul.md
+memory/user.md
+memory/session.md
+memory/tasks.json
+memory/heartbeat.log
+memory/hourly.log
+memory/daily.log
+memory/archive/
+
+# Keep these (safe to commit)
+!memory/templates/
+!memory/README.md

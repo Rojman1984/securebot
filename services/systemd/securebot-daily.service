@@ -1,0 +1,7 @@
+[Unit]
+Description=SecureBot Daily Report
+
+[Service]
+Type=oneshot
+User=tasker0
+ExecStart=/home/tasker0/securebot/services/scripts/daily_report.sh

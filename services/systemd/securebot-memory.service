@@ -1,0 +1,16 @@
+[Unit]
+Description=SecureBot Memory Service
+After=docker.service network.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=tasker0
+WorkingDirectory=/home/tasker0/securebot
+ExecStart=/usr/bin/docker compose up memory-service
+ExecStop=/usr/bin/docker compose stop memory-service
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

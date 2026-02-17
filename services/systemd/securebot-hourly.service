@@ -1,0 +1,7 @@
+[Unit]
+Description=SecureBot Hourly Summary
+
+[Service]
+Type=oneshot
+User=tasker0
+ExecStart=/home/tasker0/securebot/services/scripts/hourly_summary.sh

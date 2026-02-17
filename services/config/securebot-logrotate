@@ -1,0 +1,9 @@
+/home/tasker0/securebot/memory/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 tasker0 tasker0
+}

@@ -2,8 +2,9 @@ version: '3.8'
 
 services:
   vault:
-    build: ./vault
-    container_name: vault
+    build:
+      context: .           # Changed from ./vault
+      dockerfile: vault/Dockerfile
     environment:
       - VAULT_PASSWORD=${VAULT_PASSWORD:-change-me-in-production}
     volumes:
@@ -20,12 +21,15 @@ services:
       retries: 3
 
   gateway:
-    build: ./gateway
+    build:
+      context: .           # Changed from ./gateway
+      dockerfile: gateway/Dockerfile
     container_name: gateway
     environment:
       - VAULT_URL=http://vault:8200
       - OLLAMA_HOST=http://host.docker.internal:11434
       - OLLAMA_MODEL=phi4-mini:3.8b
+      - MEMORY_SERVICE_URL=http://memory-service:8300
     volumes:
       - /home/tasker0/securebot/skills:/home/tasker0/securebot/skills
     networks:
@@ -34,11 +38,32 @@ services:
       - "8080:8080"
     depends_on:
       - vault
+      - memory-service
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  memory-service:
+    build:
+      context: ./services/memory
+      dockerfile: Dockerfile
+    container_name: memory-service
+    environment:
+      - MEMORY_DIR=/memory
+    volumes:
+      - ./memory:/memory
+    networks:
+      - securebot
+    ports:
+      - "8300:8300"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8300/health"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -1,0 +1,62 @@
+# SecureBot User Configuration
+# Copy this file to ~/.securebot/config.yml to customize
+
+# Skill Configuration
+skills:
+  # Enable or disable specific skills
+  # If not specified, all skills are enabled by default
+
+  # enabled_skills:
+  #   - search-google
+  #   - search-tavily
+  #   - search-duckduckgo
+  #   - python-string-reversal
+
+  # disabled_skills:
+  #   - search-tavily  # Example: disable Tavily to save monthly quota
+
+  # Search provider priority override
+  # Lower numbers = higher priority
+  # If not specified, uses default priorities from SKILL.md files
+  search_priority:
+    search-google: 1      # Try Google first (if API key configured)
+    search-tavily: 2      # Try Tavily second (if API key configured)
+    search-duckduckgo: 3  # DuckDuckGo as fallback
+
+# Gateway Configuration
+gateway:
+  # Search detection sensitivity
+  # Options: strict, normal, relaxed
+  # strict: Only trigger search on explicit phrases like "search for"
+  # normal: Balanced detection (default)
+  # relaxed: Trigger search more liberally
+  search_detection: normal
+
+  # Maximum search results to return
+  max_search_results: 3
+
+# Vault Configuration
+vault:
+  # Rate limit overrides (optional)
+  # Use to be more conservative than provider defaults
+  rate_limits:
+    google:
+      daily: 50      # Default: 100
+      monthly: 1500  # Default: 3000
+    tavily:
+      monthly: 500   # Default: 1000
+
+# Orchestrator Configuration
+orchestrator:
+  # Skill creation threshold
+  # Options: conservative, normal, aggressive
+  # conservative: Create fewer skills, use direct Claude more often
+  # normal: Balanced skill creation (default)
+  # aggressive: Create skills more readily
+  skill_creation: normal
+
+  # Default model for Ollama
+  ollama_model: "phi4-mini:3.8b"
+
+  # Default Claude model for skill creation
+  claude_model: "claude-sonnet-4-20250514"

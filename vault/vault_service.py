@@ -10,12 +10,19 @@ License: MIT
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
+import sys
 import json
 import httpx
 from collections import defaultdict
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 import logging
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from common.config import get_config
 
 # Configure logging
 logging.basicConfig(
@@ -199,7 +206,7 @@ class DuckDuckGoSearch(SearchProvider):
     async def search(self, query: str, max_results: int = 10) -> List[Dict[str, str]]:
         """Execute DuckDuckGo search"""
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
             
             ddg = DDGS()
             results = ddg.text(query, max_results=max_results)
@@ -225,43 +232,58 @@ class SearchOrchestrator:
     def __init__(self, config: Dict[str, Any]):
         self.providers = []
         self.usage_tracker = UsageTracker()
-        
-        # Initialize Google Custom Search if configured
-        if config.get("google_api_key") and config.get("google_cx"):
+        self.user_config = get_config()
+
+        # Initialize Google Custom Search if configured AND enabled
+        if (config.get("google_api_key") and config.get("google_cx") and
+            self.user_config.is_skill_enabled("search-google")):
+
+            # Get rate limits from user config or use defaults
+            daily_limit = self.user_config.get_rate_limit("google", "daily") or 100
+            monthly_limit = self.user_config.get_rate_limit("google", "monthly") or 3000
+
             self.providers.append({
                 "provider": GoogleCustomSearch(
                     config["google_api_key"],
                     config["google_cx"]
                 ),
                 "name": "google",
-                "daily_limit": 100,
-                "monthly_limit": 3000,
-                "priority": 1
+                "daily_limit": daily_limit,
+                "monthly_limit": monthly_limit,
+                "priority": self.user_config.get_skill_priority("search-google", 1)
             })
-            logger.info("Google Custom Search provider initialized")
-        
-        # Initialize Tavily if configured
-        if config.get("tavily_api_key"):
+            logger.info(f"Google Custom Search provider initialized (priority: {self.providers[-1]['priority']})")
+
+        # Initialize Tavily if configured AND enabled
+        if (config.get("tavily_api_key") and
+            self.user_config.is_skill_enabled("search-tavily")):
+
+            # Get rate limits from user config or use defaults
+            monthly_limit = self.user_config.get_rate_limit("tavily", "monthly") or 1000
+
             self.providers.append({
                 "provider": TavilySearch(config["tavily_api_key"]),
                 "name": "tavily",
-                "monthly_limit": 1000,
-                "priority": 2
+                "monthly_limit": monthly_limit,
+                "priority": self.user_config.get_skill_priority("search-tavily", 2)
             })
-            logger.info("Tavily Search provider initialized")
-        
-        # Always have DuckDuckGo as fallback
-        self.providers.append({
-            "provider": DuckDuckGoSearch(),
-            "name": "duckduckgo",
-            "priority": 3
-        })
-        logger.info("DuckDuckGo Search provider initialized (fallback)")
-        
-        # Sort by priority
+            logger.info(f"Tavily Search provider initialized (priority: {self.providers[-1]['priority']})")
+
+        # Always have DuckDuckGo as fallback if enabled (enabled by default)
+        if self.user_config.is_skill_enabled("search-duckduckgo"):
+            self.providers.append({
+                "provider": DuckDuckGoSearch(),
+                "name": "duckduckgo",
+                "priority": self.user_config.get_skill_priority("search-duckduckgo", 3)
+            })
+            logger.info(f"DuckDuckGo Search provider initialized (priority: {self.providers[-1]['priority']})")
+
+        # Sort by priority (lower = higher precedence)
         self.providers.sort(key=lambda x: x["priority"])
-        
+
         logger.info(f"Search orchestrator initialized with {len(self.providers)} providers")
+        if self.providers:
+            logger.info(f"Provider order: {[p['name'] for p in self.providers]}")
     
     async def search(self, query: str, max_results: int = 10) -> Dict[str, Any]:
         """

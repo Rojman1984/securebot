@@ -1,0 +1,19 @@
+# Test configuration - disables Tavily to test filtering
+
+skills:
+  disabled_skills:
+    - search-tavily
+
+  search_priority:
+    search-google: 1
+    search-duckduckgo: 2
+
+gateway:
+  search_detection: strict
+  max_search_results: 5
+
+vault:
+  rate_limits:
+    google:
+      daily: 50
+      monthly: 1500

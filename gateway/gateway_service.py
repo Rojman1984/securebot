@@ -11,13 +11,19 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 import os
+import sys
 from typing import Optional, Dict, Any, List
 import logging
 from datetime import datetime
 import json
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import our orchestrator
 from orchestrator import route_query, SkillMatcher
+from common.config import get_config
 
 # Configure logging
 logging.basicConfig(
@@ -38,22 +44,82 @@ class Message(BaseModel):
 
 
 class SearchDetector:
-    """Detect if query needs web search"""
-    
-    SEARCH_INDICATORS = [
-        lambda text: any(phrase in text.lower() for phrase in [
-            "search for",
-            "find information about",
-            "latest news about",
-            "recent news about",
-            "look up"
-        ])
-    ]
-    
-    @classmethod
-    def needs_search(cls, text: str) -> bool:
+    """Detect if query needs web search - now skill-based"""
+
+    def __init__(self, skills_dir: str = "/home/tasker0/securebot/skills"):
+        """Initialize with skills from directory"""
+        self.skills_dir = Path(skills_dir)
+        self.config = get_config()
+        self.search_skills = self._load_search_skills()
+
+        # Determine sensitivity based on config
+        detection_mode = self.config.get("gateway.search_detection", "normal")
+        self._set_indicators(detection_mode)
+
+    def _load_search_skills(self) -> List[Dict[str, Any]]:
+        """Load all search skills from skills directory"""
+        from orchestrator import SkillMatcher
+
+        matcher = SkillMatcher(str(self.skills_dir))
+        search_skills = []
+
+        for skill_name, skill in matcher.skills.items():
+            # Check if it's a search skill
+            category = skill.get('frontmatter', {}).get('category')
+            if category == 'search':
+                # Check if skill is enabled in config
+                if self.config.is_skill_enabled(skill_name):
+                    search_skills.append(skill)
+                    logger.info(f"Loaded search skill: {skill_name}")
+
+        # Sort by priority
+        search_skills.sort(key=lambda s: self.config.get_skill_priority(
+            s['name'],
+            s.get('frontmatter', {}).get('priority', 999)
+        ))
+
+        return search_skills
+
+    def _set_indicators(self, mode: str) -> None:
+        """Set search indicators based on detection mode"""
+        if mode == "strict":
+            self.SEARCH_INDICATORS = [
+                lambda text: any(phrase in text.lower() for phrase in [
+                    "search for",
+                    "find information about",
+                    "look up"
+                ])
+            ]
+        elif mode == "relaxed":
+            self.SEARCH_INDICATORS = [
+                lambda text: any(phrase in text.lower() for phrase in [
+                    "search", "find", "look up", "what is", "who is",
+                    "latest", "recent", "news about", "information about"
+                ])
+            ]
+        else:  # normal
+            self.SEARCH_INDICATORS = [
+                lambda text: any(phrase in text.lower() for phrase in [
+                    "search for",
+                    "find information about",
+                    "latest news about",
+                    "recent news about",
+                    "look up"
+                ])
+            ]
+
+    def needs_search(self, text: str) -> bool:
         """Check if query needs web search"""
-        return any(indicator(text) for indicator in cls.SEARCH_INDICATORS)
+        # No search skills available
+        if not self.search_skills:
+            logger.warning("No search skills available")
+            return False
+
+        return any(indicator(text) for indicator in self.SEARCH_INDICATORS)
+
+    def get_available_providers(self) -> List[str]:
+        """Get list of available search provider names"""
+        return [skill['name'] for skill in self.search_skills]
 
 
 class GatewayService:
@@ -64,13 +130,15 @@ class GatewayService:
     def __init__(self):
         self.vault_url = os.getenv("VAULT_URL", "http://vault:8200")
         self.ollama_url = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+        self.config = get_config()
         self.search_detector = SearchDetector()
-        
+
         # Initialize skill matcher for stats
         self.skill_matcher = SkillMatcher()
-        
+
         logger.info(f"Gateway initialized - Vault: {self.vault_url}, Ollama: {self.ollama_url}")
-        logger.info(f"Loaded {len(self.skill_matcher.skills)} skills")
+        logger.info(f"Loaded {len(self.skill_matcher.skills)} total skills")
+        logger.info(f"Search providers available: {self.search_detector.get_available_providers()}")
     
     async def process_message(self, message: Message) -> Dict[str, Any]:
         """
@@ -87,23 +155,26 @@ class GatewayService:
             # Step 1: Check if we need web search
             needs_search = self.search_detector.needs_search(message.text)
             search_results = None
-            
+            has_search_results = False
+
             if needs_search:
                 logger.info(f"Query requires web search: {message.text[:50]}...")
                 search_results = await self._execute_search(message.text)
-                
+
                 # If we got search results, augment the query
                 if search_results:
                     message.text = self._build_search_context(message.text, search_results)
-            
+                    has_search_results = True
+
             # Step 2: Route through orchestrator
-            logger.info(f"Routing query through orchestrator")
-            
+            logger.info(f"Routing query through orchestrator (has_search_results={has_search_results})")
+
             orchestrator_result = await route_query(
                 query=message.text,
                 user_id=message.user_id,
                 vault_url=self.vault_url,
-                ollama_url=self.ollama_url
+                ollama_url=self.ollama_url,
+                has_search_results=has_search_results
             )
             
             # Calculate processing time
@@ -143,6 +214,8 @@ class GatewayService:
     async def _execute_search(self, query: str) -> Optional[List[Dict[str, str]]]:
         """Execute web search via Vault"""
         try:
+            max_results = self.config.get("gateway.max_search_results", 3)
+
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
                     f"{self.vault_url}/execute",
@@ -150,12 +223,12 @@ class GatewayService:
                         "tool": "web_search",
                         "params": {
                             "query": query,
-                            "max_results": 3  # Reduced for faster processing
+                            "max_results": max_results
                         },
                         "session_id": "gateway"
                     }
                 )
-                
+
                 if response.status_code == 200:
                     data = response.json()
                     logger.info(f"Search completed with {data.get('provider', 'unknown')} provider")
@@ -163,7 +236,7 @@ class GatewayService:
                 else:
                     logger.error(f"Search failed: HTTP {response.status_code}")
                     return None
-                    
+
         except Exception as e:
             logger.error(f"Search execution failed: {e}")
             return None

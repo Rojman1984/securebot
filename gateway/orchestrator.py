@@ -8,6 +8,7 @@ License: MIT
 """
 
 import os
+import sys
 import json
 import subprocess
 import logging
@@ -16,6 +17,11 @@ from typing import Optional, Dict, Any, List
 import httpx
 import yaml
 from datetime import datetime
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from common.config import get_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,35 +32,42 @@ logger = logging.getLogger(__name__)
 
 class SkillMatcher:
     """Match queries to existing skills using Claude Code format"""
-    
+
     def __init__(self, skills_dir: str = "/home/tasker0/securebot/skills"):
         self.skills_dir = Path(skills_dir)
         self.skills_dir.mkdir(parents=True, exist_ok=True)
+        self.config = get_config()
         self.skills = self._load_skills()
     
     def _load_skills(self) -> Dict[str, Any]:
-        """Load all Claude Code format skills"""
+        """Load all Claude Code format skills (respecting user config)"""
         skills = {}
-        
+
         if not self.skills_dir.exists():
             return skills
-        
+
         # Look for SKILL.md files in skill directories
         for skill_dir in self.skills_dir.iterdir():
             if not skill_dir.is_dir():
                 continue
-                
+
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.exists():
                 continue
-            
+
             try:
                 skill = self._parse_skill_file(skill_file)
-                skills[skill['name']] = skill
-                logger.info(f"Loaded skill: {skill['name']}")
+
+                # Check if skill is enabled in config
+                if self.config.is_skill_enabled(skill['name']):
+                    skills[skill['name']] = skill
+                    logger.info(f"Loaded skill: {skill['name']} (category: {skill.get('category', 'general')})")
+                else:
+                    logger.info(f"Skipped disabled skill: {skill['name']}")
+
             except Exception as e:
                 logger.error(f"Failed to load skill {skill_file}: {e}")
-        
+
         return skills
     
     def _parse_skill_file(self, skill_file: Path) -> Dict[str, Any]:
@@ -77,6 +90,8 @@ class SkillMatcher:
         return {
             'name': frontmatter.get('name', skill_file.parent.name),
             'description': frontmatter.get('description', ''),
+            'category': frontmatter.get('category', 'general'),
+            'priority': frontmatter.get('priority', 999),
             'content': markdown_content,
             'frontmatter': frontmatter,
             'path': skill_file,
@@ -87,43 +102,92 @@ class SkillMatcher:
         """Extract trigger keywords from description"""
         # Simple keyword extraction
         words = description.lower().split()
-        # Filter out common words
-        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for'}
+        # Filter out common words - expanded to prevent false matches
+        stop_words = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'this', 'that', 'with', 'from', 'will', 'when', 'where', 'what', 'how',
+            'your', 'you', 'any', 'all', 'can', 'use', 'using', 'used', 'useful',
+            'data', 'text', 'string', 'function', 'method', 'code', 'program',
+            'processing', 'manipulation', 'practice', 'algorithm', 'implementation'
+        }
         return [w for w in words if w not in stop_words and len(w) > 3]
     
-    def find_matching_skill(self, query: str) -> Optional[Dict[str, Any]]:
-        """Find skill that best matches the query"""
+    def find_matching_skill(self, query: str, category: Optional[str] = None, exclude_categories: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Find skill that best matches the query
+
+        Args:
+            query: Query text to match
+            category: Optional category filter (e.g., 'search')
+            exclude_categories: Optional list of categories to exclude (e.g., ['search'])
+
+        Returns:
+            Best matching skill or None
+        """
         query_lower = query.lower()
         best_match = None
         best_score = 0
-        
-        for skill_name, skill in self.skills.items():
+
+        # Filter by category if specified
+        skills_to_check = self.skills.items()
+        if category:
+            skills_to_check = [(name, skill) for name, skill in skills_to_check
+                              if skill.get('category') == category]
+        elif exclude_categories:
+            # Exclude specific categories
+            skills_to_check = [(name, skill) for name, skill in skills_to_check
+                              if skill.get('category') not in exclude_categories]
+
+        for skill_name, skill in skills_to_check:
             score = 0
-            
-            # Check trigger words
+
+            # Check trigger words (higher weight for specificity)
             for trigger in skill['triggers']:
                 if trigger in query_lower:
-                    score += 2
-            
-            # Check if query mentions skill name
+                    score += 3  # Increased from 2 to require stronger match
+
+            # Check if query mentions skill name (exact match)
             if skill_name.replace('-', ' ') in query_lower:
-                score += 3
-            
-            # Check description overlap
+                score += 5  # Increased from 3 for exact name match
+
+            # Check description overlap (reduced weight to prevent false matches)
             desc_words = set(skill['description'].lower().split())
             query_words = set(query_lower.split())
             overlap = len(desc_words & query_words)
-            score += overlap
-            
+            score += overlap * 0.5  # Reduced weight from 1 to 0.5 per overlap
+
             if score > best_score:
                 best_score = score
                 best_match = skill
-        
-        # Require minimum score
-        if best_score >= 2:
+
+        # Require STRONGER minimum score to prevent false matches
+        if best_score >= 5:  # Increased from 2 to 5
             return best_match
-        
+
         return None
+
+    def get_skills_by_category(self, category: str) -> List[Dict[str, Any]]:
+        """
+        Get all skills in a category, sorted by priority
+
+        Args:
+            category: Category name (e.g., 'search')
+
+        Returns:
+            List of skills sorted by priority (lower priority = higher precedence)
+        """
+        category_skills = [
+            skill for skill in self.skills.values()
+            if skill.get('category') == category
+        ]
+
+        # Sort by configured priority first, then skill's own priority
+        category_skills.sort(key=lambda s: (
+            self.config.get_skill_priority(s['name'], s.get('priority', 999)),
+            s.get('priority', 999)
+        ))
+
+        return category_skills
 
 
 class ComplexityClassifier:
@@ -215,11 +279,13 @@ class ComplexityClassifier:
 
 class ClaudeCodeOrchestrator:
     """Orchestrate Claude Code CLI for skill management"""
-    
-    def __init__(self, vault_url: str = "http://vault:8200"):
+
+    def __init__(self, vault_url: str = "http://vault:8200", memory_service_url: Optional[str] = None):
         self.vault_url = vault_url
+        self.memory_service_url = memory_service_url or os.getenv("MEMORY_SERVICE_URL", "http://memory-service:8300")
         self.skills_dir = Path("/home/tasker0/securebot/skills")
         self.skills_dir.mkdir(parents=True, exist_ok=True)
+        self.memory_context = None
     
     async def create_skill(self, query: str, purpose: str) -> Dict[str, Any]:
         """
@@ -312,33 +378,55 @@ Generate the complete SKILL.md now:
             logger.error(f"Failed to create skill: {e}")
             raise
     
+    async def load_memory_context(self):
+        """Load combined memory context from memory service"""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{self.memory_service_url}/memory/context")
+                if response.status_code == 200:
+                    data = response.json()
+                    self.memory_context = data.get("content", "")
+                    logger.info("Memory context loaded successfully")
+                else:
+                    logger.warning(f"Failed to load memory context: HTTP {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Could not load memory context: {e}")
+            # Graceful fallback - continue without memory
+
     async def execute_skill(
-        self, 
-        skill: Dict[str, Any], 
-        query: str, 
+        self,
+        skill: Dict[str, Any],
+        query: str,
         arguments: str,
         ollama_url: str
     ) -> str:
         """Execute skill with Ollama"""
         logger.info(f"Executing skill: {skill['name']}")
-        
+
+        # Load memory context if not already loaded
+        if self.memory_context is None:
+            await self.load_memory_context()
+
         # Build prompt from skill content with arguments
         skill_content = skill['content']
-        
+
         # Replace $ARGUMENTS placeholder
         if '$ARGUMENTS' in skill_content:
             skill_content = skill_content.replace('$ARGUMENTS', arguments)
         else:
             # Append arguments if not in template
             skill_content = f"{skill_content}\n\nARGUMENTS: {arguments}"
-        
+
         # Replace session ID if present
         if '${CLAUDE_SESSION_ID}' in skill_content:
             session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
             skill_content = skill_content.replace('${CLAUDE_SESSION_ID}', session_id)
-        
-        # Final prompt
-        final_prompt = f"{skill_content}\n\nUser query: {query}"
+
+        # Prepend memory context if available
+        if self.memory_context:
+            final_prompt = f"{self.memory_context}\n\n---\n\n{skill_content}\n\nUser query: {query}"
+        else:
+            final_prompt = f"{skill_content}\n\nUser query: {query}"
         
         # Execute with Ollama
         try:
@@ -391,31 +479,75 @@ Generate the complete SKILL.md now:
 
 # Main routing function for Gateway integration
 async def route_query(
-    query: str, 
+    query: str,
     user_id: str,
     vault_url: str = "http://vault:8200",
-    ollama_url: str = "http://host.docker.internal:11434"
+    ollama_url: str = "http://host.docker.internal:11434",
+    has_search_results: bool = False,
+    memory_service_url: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Main routing logic for intelligent query handling
-    
+
     This is the entry point called by Gateway
+
+    Args:
+        query: User query (may be augmented with search results)
+        user_id: User identifier
+        vault_url: Vault service URL
+        ollama_url: Ollama service URL
+        has_search_results: If True, query contains search results and should skip skill matching
     """
-    
-    # Step 1: Check for matching skill
+
+    # IMPORTANT: If query has search results, skip ALL skill logic and go directly to Ollama
+    if has_search_results:
+        logger.info("Query has search results - skipping skill matching/creation, using Ollama for summarization")
+        logger.info(f"Query: '{query[:100]}...'")
+
+        # Load memory context
+        orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
+        await orchestrator.load_memory_context()
+
+        # Prepend memory context if available
+        if orchestrator.memory_context:
+            enhanced_query = f"{orchestrator.memory_context}\n\n---\n\n{query}"
+        else:
+            enhanced_query = query
+
+        # Use Ollama directly to summarize search results
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": "phi4-mini:3.8b",
+                    "prompt": enhanced_query,
+                    "stream": False
+                }
+            )
+            result = response.json().get("response", "")
+
+        return {
+            "result": result,
+            "method": "direct_ollama",
+            "cost": 0.0,
+            "engine": "ollama"
+        }
+
+    # Step 1: Check for matching skill (only if no search results)
     matcher = SkillMatcher()
-    matching_skill = matcher.find_matching_skill(query)
-    
+    matching_skill = matcher.find_matching_skill(query, exclude_categories=['search'])
+
     # Step 2: Classify complexity
     complexity = ComplexityClassifier.classify(query, bool(matching_skill))
-    
+
     logger.info(f"Query: '{query[:50]}...'")
+    logger.info(f"Has search results: {has_search_results}")
     logger.info(f"Classification: {complexity}")
     if matching_skill:
         logger.info(f"Matched skill: {matching_skill['name']}")
     
     # Step 3: Route based on classification
-    orchestrator = ClaudeCodeOrchestrator(vault_url)
+    orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
     
     if complexity == "skill_execution":
         # Execute with existing skill
@@ -474,18 +606,28 @@ async def route_query(
     else:  # direct_ollama
         # Simple query, Ollama direct
         logger.info("Using Ollama directly for simple query")
-        
+
+        # Load memory context
+        if orchestrator.memory_context is None:
+            await orchestrator.load_memory_context()
+
+        # Prepend memory context if available
+        if orchestrator.memory_context:
+            enhanced_query = f"{orchestrator.memory_context}\n\n---\n\nUser query: {query}"
+        else:
+            enhanced_query = query
+
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{ollama_url}/api/generate",
                 json={
                     "model": "phi4-mini:3.8b",
-                    "prompt": query,
+                    "prompt": enhanced_query,
                     "stream": False
                 }
             )
             result = response.json().get("response", "")
-        
+
         return {
             "result": result,
             "method": "direct_ollama",
