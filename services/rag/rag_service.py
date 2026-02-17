@@ -5,16 +5,22 @@ Embeds memory files and conversation history into ChromaDB
 Retrieves relevant context for queries without loading full memory
 """
 import os
+import sys
 import re
 import httpx
 import chromadb
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from common.auth import verify_service_request, create_auth_dependency
 
 app = FastAPI(title="SecureBot RAG Service")
 
@@ -24,6 +30,12 @@ MEMORY_DIR = Path(os.getenv("MEMORY_DIR", "/memory"))
 CHROMA_DIR = Path(os.getenv("CHROMA_DIR", "/chroma"))
 EMBEDDING_MODEL = "nomic-embed-text"
 MAX_CONVERSATIONS = 100
+
+# Auth configuration
+ALLOWED_CALLERS = os.getenv("ALLOWED_CALLERS", "gateway,memory-service,heartbeat").split(",")
+
+# Create auth dependency
+auth_required = create_auth_dependency(ALLOWED_CALLERS)
 
 # Initialize ChromaDB
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
@@ -183,8 +195,11 @@ async def health_check():
 
 
 @app.post("/embed/memory")
-async def embed_memory():
-    """Re-embed all memory files"""
+async def embed_memory(
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Re-embed all memory files. Requires HMAC authentication."""
     try:
         chunks_embedded = await embed_memory_files()
         return {
@@ -197,8 +212,12 @@ async def embed_memory():
 
 
 @app.post("/embed/conversation")
-async def embed_conversation(turn: ConversationTurn):
-    """Store a conversation turn"""
+async def embed_conversation(
+    turn: ConversationTurn,
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Store a conversation turn. Requires HMAC authentication."""
     try:
         # Truncate long messages
         user_text = turn.user[:500]
@@ -231,10 +250,16 @@ async def embed_conversation(turn: ConversationTurn):
 
 
 @app.get("/context")
-async def get_context(query: str, max_tokens: int = 300):
+async def get_context(
+    query: str,
+    max_tokens: int = 300,
+    request: Request = None,
+    _auth = Depends(auth_required)
+):
     """
     Get relevant context for a query
     Searches memory (top 2) and conversations (top 1)
+    Requires HMAC authentication.
     """
     try:
         # Get query embedding
@@ -291,9 +316,13 @@ async def get_context(query: str, max_tokens: int = 300):
 
 
 @app.post("/summarize/session")
-async def summarize_session():
+async def summarize_session(
+    request: Request,
+    _auth = Depends(auth_required)
+):
     """
     Summarize current session.md to 200 tokens max
+    Requires HMAC authentication.
     Save summary and re-embed memory
     """
     try:

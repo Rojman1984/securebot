@@ -511,11 +511,51 @@ docker-compose logs -f vault
 
 ## 🔐 Security
 
+SecureBot implements **defense-in-depth security** with multiple layers:
+
+### 🔒 Inter-Service Authentication
+
+- **HMAC-SHA256 Signed Requests** - All service-to-service communication is cryptographically signed
+- **Replay Attack Prevention** - 30-second timestamp window + nonce tracking
+- **Service Trust Matrix** - Each service explicitly defines who can call it
+- **Zero External Access** - External requests to internal services are rejected (401 Unauthorized)
+
+### 🔑 Secret Management
+
 - **Secrets Isolation** - API keys never exposed to AI models
 - **Vault Pattern** - Secrets injected at execution time only
 - **No Prompt Injection** - AI cannot access credentials via clever prompts
-- **Docker Network** - Services communicate on isolated bridge network
+- **Environment Variables** - Secrets stored in `.env` (gitignored, never committed)
+
+### 🌐 Network Security
+
+- **Docker Network Isolation** - Services communicate on private `securebot` bridge network
+- **Port Restrictions** - Only gateway (8080) exposed externally
+- **Health Endpoints Public** - `/health` endpoints remain accessible for Docker healthchecks
+
+### 🏠 Privacy
+
 - **Local First** - Your data stays on your hardware
+- **No Telemetry** - No analytics, tracking, or data collection
+- **Your Models** - Use ANY Ollama model, hosted on YOUR machine
+
+### 📚 Security Documentation
+
+- **Full Security Model:** See [docs/SECURITY.md](docs/SECURITY.md)
+- **Setup Guide:** Run `bash services/scripts/setup_auth.sh`
+- **Trust Matrix:** Details which services can communicate
+- **Troubleshooting:** Common auth issues and solutions
+
+### 🛡️ What This Protects Against
+
+✅ Unauthorized access to internal services
+✅ Replay attacks (duplicate/old requests)
+✅ Man-in-the-middle tampering
+✅ Service impersonation
+✅ Prompt injection credential theft
+✅ External API abuse
+
+**Note:** For production deployments requiring maximum security, consider implementing mTLS (mutual TLS) with client certificates. Contact for implementation guidance.
 
 ---
 

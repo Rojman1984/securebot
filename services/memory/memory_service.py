@@ -5,15 +5,22 @@ Minimal FastAPI service for memory file management.
 Just reads/writes memory files, no complex logic.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from datetime import datetime
 import json
 import os
+import sys
 import httpx
 import logging
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from common.auth import verify_service_request, SignedClient, create_auth_dependency
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +35,17 @@ USER_FILE = f"{MEMORY_DIR}/user.md"
 SESSION_FILE = f"{MEMORY_DIR}/session.md"
 TASKS_FILE = f"{MEMORY_DIR}/tasks.json"
 HEARTBEAT_LOG = f"{MEMORY_DIR}/heartbeat.log"
+
+# Auth configuration
+ALLOWED_CALLERS = os.getenv("ALLOWED_CALLERS", "gateway,rag-service,heartbeat").split(",")
+SERVICE_ID = os.getenv("SERVICE_ID", "memory-service")
+SERVICE_SECRET = os.getenv("SERVICE_SECRET", "")
+
+# Initialize signed client for outgoing requests
+signed_client = SignedClient(SERVICE_ID, SERVICE_SECRET) if SERVICE_SECRET else None
+
+# Create auth dependency
+auth_required = create_auth_dependency(ALLOWED_CALLERS)
 
 
 # Models
@@ -80,7 +98,12 @@ async def trigger_reembedding():
     """Trigger RAG service to re-embed memory after updates"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(f"{RAG_URL}/embed/memory")
+            if signed_client:
+                response = await signed_client.post(client, f"{RAG_URL}/embed/memory")
+            else:
+                # Fallback for local dev without auth
+                response = await client.post(f"{RAG_URL}/embed/memory")
+
             if response.status_code == 200:
                 logger.info("RAG re-embedding triggered successfully")
             else:
@@ -121,26 +144,39 @@ async def health_check():
 
 # Memory endpoints
 @app.get("/memory/soul")
-async def get_soul():
-    """Get SecureBot's soul/identity"""
+async def get_soul(
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Get SecureBot's soul/identity. Requires HMAC authentication."""
     return {"content": read_file(SOUL_FILE)}
 
 
 @app.get("/memory/user")
-async def get_user():
-    """Get user profile"""
+async def get_user(
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Get user profile. Requires HMAC authentication."""
     return {"content": read_file(USER_FILE)}
 
 
 @app.get("/memory/session")
-async def get_session():
-    """Get current session context"""
+async def get_session(
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Get current session context. Requires HMAC authentication."""
     return {"content": read_file(SESSION_FILE)}
 
 
 @app.post("/memory/session")
-async def update_session(update: SessionUpdate):
-    """Update session context fields"""
+async def update_session(
+    update: SessionUpdate,
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Update session context fields. Requires HMAC authentication."""
     try:
         content = read_file(SESSION_FILE)
         lines = content.split('\n')
@@ -181,8 +217,11 @@ async def update_session(update: SessionUpdate):
 
 
 @app.get("/memory/context")
-async def get_combined_context():
-    """Get combined context for Ollama prompts"""
+async def get_combined_context(
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Get combined context for Ollama prompts. Requires HMAC authentication."""
     try:
         soul = read_file(SOUL_FILE)
         user = read_file(USER_FILE)
@@ -207,14 +246,21 @@ async def get_combined_context():
 
 # Task endpoints
 @app.get("/tasks")
-async def get_tasks():
-    """Get all tasks"""
+async def get_tasks(
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Get all tasks. Requires HMAC authentication."""
     return read_json(TASKS_FILE)
 
 
 @app.post("/tasks")
-async def create_task(task: TaskCreate):
-    """Add a new task"""
+async def create_task(
+    task: TaskCreate,
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Add a new task. Requires HMAC authentication."""
     try:
         tasks_data = read_json(TASKS_FILE)
 
@@ -250,8 +296,13 @@ async def create_task(task: TaskCreate):
 
 
 @app.put("/tasks/{task_id}")
-async def update_task(task_id: str, update: TaskUpdate):
-    """Update a task"""
+async def update_task(
+    task_id: str,
+    update: TaskUpdate,
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Update a task. Requires HMAC authentication."""
     try:
         tasks_data = read_json(TASKS_FILE)
 
@@ -289,8 +340,12 @@ async def update_task(task_id: str, update: TaskUpdate):
 
 
 @app.post("/tasks/{task_id}/complete")
-async def complete_task(task_id: str):
-    """Mark task as completed and move to completed list"""
+async def complete_task(
+    task_id: str,
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Mark task as completed and move to completed list. Requires HMAC authentication."""
     try:
         tasks_data = read_json(TASKS_FILE)
 
@@ -328,8 +383,11 @@ async def complete_task(task_id: str):
 
 
 @app.get("/memory/heartbeat")
-async def get_heartbeat():
-    """Get last 50 lines of heartbeat log"""
+async def get_heartbeat(
+    request: Request,
+    _auth = Depends(auth_required)
+):
+    """Get last 50 lines of heartbeat log. Requires HMAC authentication."""
     try:
         with open(HEARTBEAT_LOG, 'r') as f:
             lines = f.readlines()

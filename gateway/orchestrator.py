@@ -22,6 +22,7 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common.config import get_config
+from common.auth import SignedClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -364,6 +365,11 @@ class ClaudeCodeOrchestrator:
         self.skills_dir = Path("/home/tasker0/securebot/skills")
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self.memory_context = None
+
+        # Initialize signed client for inter-service auth
+        service_id = os.getenv("SERVICE_ID", "gateway")
+        service_secret = os.getenv("SERVICE_SECRET", "")
+        self.signed_client = SignedClient(service_id, service_secret) if service_secret else None
     
     async def create_skill(self, query: str, purpose: str) -> Dict[str, Any]:
         """
@@ -460,7 +466,13 @@ Generate the complete SKILL.md now:
         """Load combined memory context from memory service (legacy fallback)"""
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.get(f"{self.memory_service_url}/memory/context")
+                url = f"{self.memory_service_url}/memory/context"
+
+                if self.signed_client:
+                    response = await self.signed_client.get(client, url)
+                else:
+                    response = await client.get(url)
+
                 if response.status_code == 200:
                     data = response.json()
                     self.memory_context = data.get("content", "")
@@ -475,10 +487,14 @@ Generate the complete SKILL.md now:
         """Get relevant context from RAG service (NEW - replaces full memory loading)"""
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(
-                    f"{self.rag_url}/context",
-                    params={"query": query, "max_tokens": max_tokens}
-                )
+                url = f"{self.rag_url}/context"
+                params = {"query": query, "max_tokens": max_tokens}
+
+                if self.signed_client:
+                    response = await self.signed_client.get(client, url, params=params)
+                else:
+                    response = await client.get(url, params=params)
+
                 if response.status_code == 200:
                     data = response.json()
                     context = data.get("context", "")
@@ -552,24 +568,27 @@ Generate the complete SKILL.md now:
         """Call Claude API via Vault"""
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    f"{self.vault_url}/execute",
-                    json={
-                        "tool": "claude_api",
-                        "params": {
-                            "prompt": prompt,
-                            "max_tokens": 4000
-                        },
-                        "session_id": "orchestrator"
-                    }
-                )
-                
+                url = f"{self.vault_url}/execute"
+                payload = {
+                    "tool": "claude_api",
+                    "params": {
+                        "prompt": prompt,
+                        "max_tokens": 4000
+                    },
+                    "session_id": "orchestrator"
+                }
+
+                if self.signed_client:
+                    response = await self.signed_client.post(client, url, json=payload)
+                else:
+                    response = await client.post(url, json=payload)
+
                 if response.status_code == 200:
                     data = response.json()
                     return data.get("response", "")
                 else:
                     raise Exception(f"Claude API call failed: HTTP {response.status_code}")
-                    
+
         except Exception as e:
             logger.error(f"Claude API call failed: {e}")
             raise

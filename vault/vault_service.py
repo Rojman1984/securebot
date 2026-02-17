@@ -7,7 +7,7 @@ Author: SecureBot Project
 License: MIT
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel
 import os
 import sys
@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common.config import get_config
+from common.auth import verify_service_request, create_auth_dependency
 
 # Configure logging
 logging.basicConfig(
@@ -403,20 +404,32 @@ class VaultService:
 # Initialize vault service
 vault = VaultService()
 
+# Get allowed callers from environment
+ALLOWED_CALLERS = os.getenv("ALLOWED_CALLERS", "gateway,rag-service,memory-service,heartbeat").split(",")
+
+# Create auth dependency
+auth_required = create_auth_dependency(ALLOWED_CALLERS)
+
 
 @app.post("/execute")
-async def execute_tool(request: ToolRequest) -> Dict[str, Any]:
+async def execute_tool(
+    tool_request: ToolRequest,
+    request: Request,
+    _auth = Depends(auth_required)
+) -> Dict[str, Any]:
     """
     Execute tool with injected secrets
-    
+
     The agent never sees API keys - they are injected by the vault at execution time.
     This prevents prompt injection attacks from leaking credentials.
+
+    Requires HMAC authentication from allowed services.
     """
     try:
-        if request.tool == "web_search":
+        if tool_request.tool == "web_search":
             # Multi-provider search with automatic fallback
-            query = request.params.get('query', '')
-            max_results = request.params.get('max_results', 10)
+            query = tool_request.params.get('query', '')
+            max_results = tool_request.params.get('max_results', 10)
             
             if not query:
                 raise HTTPException(status_code=400, detail="Query parameter is required")
@@ -424,20 +437,20 @@ async def execute_tool(request: ToolRequest) -> Dict[str, Any]:
             result = await vault.search_orchestrator.search(query, max_results)
             return result
         
-        elif request.tool == "claude_api":
+        elif tool_request.tool == "claude_api":
             # Inject Anthropic API key and call Claude API
             api_key = vault.get_secret("anthropic_api_key")
-            
+
             if not api_key:
                 raise HTTPException(
-                    status_code=500, 
+                    status_code=500,
                     detail="Anthropic API key not configured in vault"
                 )
-            
+
             # Extract parameters
-            prompt = request.params.get("prompt", "")
-            max_tokens = request.params.get("max_tokens", 4000)
-            model = request.params.get("model", "claude-sonnet-4-20250514")
+            prompt = tool_request.params.get("prompt", "")
+            max_tokens = tool_request.params.get("max_tokens", 4000)
+            model = tool_request.params.get("model", "claude-sonnet-4-20250514")
             
             if not prompt:
                 raise HTTPException(status_code=400, detail="Prompt is required")
@@ -495,8 +508,8 @@ async def execute_tool(request: ToolRequest) -> Dict[str, Any]:
         
         else:
             raise HTTPException(
-                status_code=400, 
-                detail=f"Unknown tool: {request.tool}"
+                status_code=400,
+                detail=f"Unknown tool: {tool_request.tool}"
             )
     
     except HTTPException:
@@ -530,10 +543,15 @@ async def health() -> Dict[str, Any]:
 
 
 @app.get("/search/usage")
-async def search_usage() -> Dict[str, Any]:
+async def search_usage(
+    request: Request,
+    _auth = Depends(auth_required)
+) -> Dict[str, Any]:
     """
     Get current search usage statistics
     Useful for monitoring rate limit consumption
+
+    Requires HMAC authentication from allowed services.
     """
     usage = {}
     for provider in ["google", "tavily", "duckduckgo"]:

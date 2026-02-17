@@ -3,6 +3,8 @@ vault/secrets/secrets.json
 *.key
 *.pem
 .env
+.env.local
+.env.*.local
 
 # User data
 data/

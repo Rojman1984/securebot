@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Import our orchestrator
 from orchestrator import route_query, SkillMatcher
 from common.config import get_config
+from common.auth import SignedClient
 
 # Configure logging
 logging.basicConfig(
@@ -137,7 +138,13 @@ class GatewayService:
         # Initialize skill matcher for stats
         self.skill_matcher = SkillMatcher()
 
+        # Initialize signed client for inter-service auth
+        service_id = os.getenv("SERVICE_ID", "gateway")
+        service_secret = os.getenv("SERVICE_SECRET", "")
+        self.signed_client = SignedClient(service_id, service_secret) if service_secret else None
+
         logger.info(f"Gateway initialized - Vault: {self.vault_url}, Ollama: {self.ollama_url}, RAG: {self.rag_url}")
+        logger.info(f"Auth enabled: {bool(self.signed_client)}")
         logger.info(f"Loaded {len(self.skill_matcher.skills)} total skills")
         logger.info(f"Search providers available: {self.search_detector.get_available_providers()}")
 
@@ -145,14 +152,18 @@ class GatewayService:
         """Store conversation turn in RAG service for future context retrieval"""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    f"{self.rag_url}/embed/conversation",
-                    json={
-                        "user": user_msg[:500],  # Truncate long messages
-                        "assistant": bot_response[:500],
-                        "timestamp": datetime.now().isoformat()
-                    }
-                )
+                url = f"{self.rag_url}/embed/conversation"
+                payload = {
+                    "user": user_msg[:500],  # Truncate long messages
+                    "assistant": bot_response[:500],
+                    "timestamp": datetime.now().isoformat()
+                }
+
+                if self.signed_client:
+                    await self.signed_client.post(client, url, json=payload)
+                else:
+                    await client.post(url, json=payload)
+
                 logger.debug("Conversation stored in RAG")
         except Exception as e:
             # Non-critical - don't fail on this
@@ -239,17 +250,20 @@ class GatewayService:
             max_results = self.config.get("gateway.max_search_results", 3)
 
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{self.vault_url}/execute",
-                    json={
-                        "tool": "web_search",
-                        "params": {
-                            "query": query,
-                            "max_results": max_results
-                        },
-                        "session_id": "gateway"
-                    }
-                )
+                url = f"{self.vault_url}/execute"
+                payload = {
+                    "tool": "web_search",
+                    "params": {
+                        "query": query,
+                        "max_results": max_results
+                    },
+                    "session_id": "gateway"
+                }
+
+                if self.signed_client:
+                    response = await self.signed_client.post(client, url, json=payload)
+                else:
+                    response = await client.post(url, json=payload)
 
                 if response.status_code == 200:
                     data = response.json()
