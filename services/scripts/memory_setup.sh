@@ -62,6 +62,24 @@ echo "  memory/user.md    (your profile)"
 echo "  memory/session.md (session context)"
 echo "  memory/tasks.json (task list)"
 echo ""
+
+# Embed memory files into ChromaDB (after docker-compose up)
+echo "Waiting for RAG service to be ready..."
+sleep 10
+
+if curl -s -f http://localhost:8400/health > /dev/null 2>&1; then
+    echo "Embedding memory files into ChromaDB..."
+    if curl -s -X POST http://localhost:8400/embed/memory | grep -q '"status":"ok"'; then
+        echo "✅ Memory embedded into ChromaDB"
+    else
+        echo "⚠️  Warning: Memory embedding failed (run services/scripts/embed_memory.sh manually)"
+    fi
+else
+    echo "⚠️  Warning: RAG service not available yet"
+    echo "    After starting docker-compose, run: services/scripts/embed_memory.sh"
+fi
+
+echo ""
 echo "Edit these files to personalize:"
 echo "  nano memory/user.md"
 echo ""

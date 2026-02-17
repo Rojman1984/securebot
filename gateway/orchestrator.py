@@ -190,33 +190,110 @@ class SkillMatcher:
         return category_skills
 
 
+class IntentClassifier:
+    """Classify query intent: ACTION vs KNOWLEDGE"""
+
+    # KNOWLEDGE intent patterns - questions seeking information/explanation
+    KNOWLEDGE_PATTERNS = [
+        # Question starters
+        "explain", "what is", "what are", "what do", "what does",
+        "why", "why is", "why are", "why do", "why does",
+        "how does", "how do", "how is", "how are",
+        "describe", "tell me about", "tell me what",
+        "define", "definition of",
+        "can you explain", "help me understand",
+        "could you explain", "would you explain",
+
+        # Comparative/informational
+        "difference between", "differences between",
+        "what's the difference", "compare",
+        "what does X mean", "what do X mean",
+        "meaning of", "purpose of",
+
+        # Knowledge queries
+        "what do you know", "do you know",
+        "have you heard", "are you familiar",
+        "summarize", "summary of",
+        "tell me", "show me what"
+    ]
+
+    # ACTION intent patterns - requests to create/build/do something
+    ACTION_PATTERNS = [
+        # Creation/generation
+        "create", "make", "build", "generate", "write",
+        "develop", "design", "implement", "code",
+
+        # Modification
+        "fix", "update", "change", "modify", "edit",
+        "refactor", "optimize", "improve", "enhance",
+
+        # Execution/automation
+        "run", "execute", "perform", "do",
+        "schedule", "automate", "set up", "setup",
+        "configure", "install",
+
+        # Data operations
+        "reverse", "convert", "transform", "process",
+        "analyze and extract", "parse",
+
+        # Search/retrieval (when action-oriented)
+        "search for", "find me", "look up", "get me",
+        "fetch", "retrieve", "pull"
+    ]
+
+    @staticmethod
+    def classify_intent(query: str) -> str:
+        """
+        Classify query intent
+
+        Returns:
+            "knowledge" - Query seeks information/explanation (→ Ollama)
+            "action" - Query requests action/creation (→ Skills or Claude)
+            "ambiguous" - Unclear (default to Ollama for safety/cost)
+        """
+        query_lower = query.lower().strip()
+
+        # Check KNOWLEDGE patterns first (higher priority)
+        for pattern in IntentClassifier.KNOWLEDGE_PATTERNS:
+            if query_lower.startswith(pattern) or f" {pattern}" in f" {query_lower}":
+                return "knowledge"
+
+        # Check ACTION patterns
+        for pattern in IntentClassifier.ACTION_PATTERNS:
+            if query_lower.startswith(pattern):
+                return "action"
+
+        # Ambiguous - default to knowledge (safer/cheaper)
+        return "knowledge"
+
+
 class ComplexityClassifier:
     """Determine routing strategy based on query complexity"""
-    
+
     @staticmethod
     def classify(query: str, has_matching_skill: bool) -> str:
         """
         Classify task complexity
-        
+
         Returns:
             "skill_execution" - Use Ollama with existing skill
             "direct_ollama" - Use Ollama directly (simple)
             "skill_creation" - Use Claude API to create skill
             "direct_claude" - Use Claude API directly (complex one-off)
         """
-        
+
         # If we have a skill, use it
         if has_matching_skill:
             return "skill_execution"
-        
+
         # Check if it's skill-worthy (repeatable pattern)
         if ComplexityClassifier._is_skill_worthy(query):
             return "skill_creation"
-        
+
         # Check if it's complex but one-off
         if ComplexityClassifier._is_complex(query):
             return "direct_claude"
-        
+
         # Simple query, use Ollama directly
         return "direct_ollama"
     
@@ -280,9 +357,10 @@ class ComplexityClassifier:
 class ClaudeCodeOrchestrator:
     """Orchestrate Claude Code CLI for skill management"""
 
-    def __init__(self, vault_url: str = "http://vault:8200", memory_service_url: Optional[str] = None):
+    def __init__(self, vault_url: str = "http://vault:8200", memory_service_url: Optional[str] = None, rag_url: Optional[str] = None):
         self.vault_url = vault_url
         self.memory_service_url = memory_service_url or os.getenv("MEMORY_SERVICE_URL", "http://memory-service:8300")
+        self.rag_url = rag_url or os.getenv("RAG_URL", "http://rag-service:8400")
         self.skills_dir = Path("/home/tasker0/securebot/skills")
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self.memory_context = None
@@ -379,9 +457,9 @@ Generate the complete SKILL.md now:
             raise
     
     async def load_memory_context(self):
-        """Load combined memory context from memory service"""
+        """Load combined memory context from memory service (legacy fallback)"""
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.get(f"{self.memory_service_url}/memory/context")
                 if response.status_code == 200:
                     data = response.json()
@@ -393,6 +471,27 @@ Generate the complete SKILL.md now:
             logger.warning(f"Could not load memory context: {e}")
             # Graceful fallback - continue without memory
 
+    async def get_relevant_context(self, query: str, max_tokens: int = 300) -> str:
+        """Get relevant context from RAG service (NEW - replaces full memory loading)"""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"{self.rag_url}/context",
+                    params={"query": query, "max_tokens": max_tokens}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    context = data.get("context", "")
+                    tokens = data.get("tokens_estimate", 0)
+                    logger.info(f"RAG context retrieved: {tokens} tokens from {len(data.get('sources', []))} sources")
+                    return context
+                else:
+                    logger.warning(f"RAG service unavailable: HTTP {response.status_code}")
+                    return ""
+        except Exception as e:
+            logger.warning(f"RAG context retrieval failed: {e}, falling back to no context")
+            return ""  # Graceful fallback
+
     async def execute_skill(
         self,
         skill: Dict[str, Any],
@@ -403,9 +502,8 @@ Generate the complete SKILL.md now:
         """Execute skill with Ollama"""
         logger.info(f"Executing skill: {skill['name']}")
 
-        # Load memory context if not already loaded
-        if self.memory_context is None:
-            await self.load_memory_context()
+        # Get relevant context from RAG (NEW - only loads relevant chunks)
+        context = await self.get_relevant_context(query, max_tokens=300)
 
         # Build prompt from skill content with arguments
         skill_content = skill['content']
@@ -422,9 +520,9 @@ Generate the complete SKILL.md now:
             session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
             skill_content = skill_content.replace('${CLAUDE_SESSION_ID}', session_id)
 
-        # Prepend memory context if available
-        if self.memory_context:
-            final_prompt = f"{self.memory_context}\n\n---\n\n{skill_content}\n\nUser query: {query}"
+        # Prepend relevant context if available (NEW - RAG context only)
+        if context:
+            final_prompt = f"Context:\n{context}\n\n---\n\n{skill_content}\n\nUser query: {query}"
         else:
             final_prompt = f"{skill_content}\n\nUser query: {query}"
         
@@ -504,13 +602,13 @@ async def route_query(
         logger.info("Query has search results - skipping skill matching/creation, using Ollama for summarization")
         logger.info(f"Query: '{query[:100]}...'")
 
-        # Load memory context
+        # Get relevant context from RAG (NEW - only relevant chunks)
         orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
-        await orchestrator.load_memory_context()
+        context = await orchestrator.get_relevant_context(query, max_tokens=300)
 
-        # Prepend memory context if available
-        if orchestrator.memory_context:
-            enhanced_query = f"{orchestrator.memory_context}\n\n---\n\n{query}"
+        # Prepend context if available
+        if context:
+            enhanced_query = f"Context:\n{context}\n\n---\n\n{query}"
         else:
             enhanced_query = query
 
@@ -533,20 +631,60 @@ async def route_query(
             "engine": "ollama"
         }
 
-    # Step 1: Check for matching skill (only if no search results)
+    # Step 1: Classify intent - KNOWLEDGE queries skip skill matching entirely
+    intent = IntentClassifier.classify_intent(query)
+    logger.info(f"Intent classification: {intent}")
+
+    # If KNOWLEDGE intent, bypass all skill logic and go directly to Ollama
+    if intent == "knowledge":
+        logger.info("KNOWLEDGE intent detected - bypassing skill matching, using Ollama directly")
+        logger.info(f"Query: '{query[:100]}...'")
+
+        # Get relevant context from RAG (NEW - only relevant chunks)
+        orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
+        context = await orchestrator.get_relevant_context(query, max_tokens=300)
+
+        # Prepend context if available
+        if context:
+            enhanced_query = f"Context:\n{context}\n\n---\n\nUser query: {query}"
+        else:
+            enhanced_query = query
+
+        # Use Ollama directly for knowledge queries
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": "phi4-mini:3.8b",
+                    "prompt": enhanced_query,
+                    "stream": False
+                }
+            )
+            result = response.json().get("response", "")
+
+        return {
+            "result": result,
+            "method": "direct_ollama",
+            "intent": "knowledge",
+            "cost": 0.0,
+            "engine": "ollama"
+        }
+
+    # Step 2: Check for matching skill (only for ACTION intent)
     matcher = SkillMatcher()
     matching_skill = matcher.find_matching_skill(query, exclude_categories=['search'])
 
-    # Step 2: Classify complexity
+    # Step 3: Classify complexity (for ACTION queries)
     complexity = ComplexityClassifier.classify(query, bool(matching_skill))
 
     logger.info(f"Query: '{query[:50]}...'")
     logger.info(f"Has search results: {has_search_results}")
+    logger.info(f"Intent: {intent}")
     logger.info(f"Classification: {complexity}")
     if matching_skill:
         logger.info(f"Matched skill: {matching_skill['name']}")
-    
-    # Step 3: Route based on classification
+
+    # Step 4: Route based on classification
     orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
     
     if complexity == "skill_execution":
@@ -607,13 +745,12 @@ async def route_query(
         # Simple query, Ollama direct
         logger.info("Using Ollama directly for simple query")
 
-        # Load memory context
-        if orchestrator.memory_context is None:
-            await orchestrator.load_memory_context()
+        # Get relevant context from RAG (NEW - only relevant chunks)
+        context = await orchestrator.get_relevant_context(query, max_tokens=300)
 
-        # Prepend memory context if available
-        if orchestrator.memory_context:
-            enhanced_query = f"{orchestrator.memory_context}\n\n---\n\nUser query: {query}"
+        # Prepend context if available
+        if context:
+            enhanced_query = f"Context:\n{context}\n\n---\n\nUser query: {query}"
         else:
             enhanced_query = query
 

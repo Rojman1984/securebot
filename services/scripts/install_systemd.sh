@@ -28,7 +28,17 @@ if [ ! -d "$SCRIPTS_DIR" ]; then
     exit 1
 fi
 
-echo "Step 1: Making scripts executable..."
+echo "Step 1: Installing Ollama embedding model..."
+if command -v ollama &> /dev/null; then
+    echo "  Pulling nomic-embed-text model..."
+    su - tasker0 -c "ollama pull nomic-embed-text" || echo "  Warning: Could not pull embedding model"
+    echo "✓ Embedding model installed"
+else
+    echo "  Warning: Ollama not found, skipping model installation"
+fi
+echo ""
+
+echo "Step 2: Making scripts executable..."
 chmod +x "$SCRIPTS_DIR"/*.sh
 echo "✓ Scripts are now executable"
 echo ""

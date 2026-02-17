@@ -1,10 +1,11 @@
 version: '3.8'
-
 services:
   vault:
     build:
-      context: .           # Changed from ./vault
+      context: .
       dockerfile: vault/Dockerfile
+    container_name: vault
+    user: "1000:1000"
     environment:
       - VAULT_PASSWORD=${VAULT_PASSWORD:-change-me-in-production}
     volumes:
@@ -22,14 +23,16 @@ services:
 
   gateway:
     build:
-      context: .           # Changed from ./gateway
+      context: .
       dockerfile: gateway/Dockerfile
     container_name: gateway
+    user: "1000:1000"
     environment:
       - VAULT_URL=http://vault:8200
       - OLLAMA_HOST=http://host.docker.internal:11434
       - OLLAMA_MODEL=phi4-mini:3.8b
       - MEMORY_SERVICE_URL=http://memory-service:8300
+      - RAG_URL=http://rag-service:8400
     volumes:
       - /home/tasker0/securebot/skills:/home/tasker0/securebot/skills
     networks:
@@ -39,6 +42,7 @@ services:
     depends_on:
       - vault
       - memory-service
+      - rag-service
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -53,8 +57,10 @@ services:
       context: ./services/memory
       dockerfile: Dockerfile
     container_name: memory-service
+    user: "1000:1000"
     environment:
       - MEMORY_DIR=/memory
+      - RAG_URL=http://rag-service:8400
     volumes:
       - ./memory:/memory
     networks:
@@ -64,6 +70,32 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8300/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  rag-service:
+    build:
+      context: .
+      dockerfile: services/rag/Dockerfile
+    container_name: rag-service
+    user: "1000:1000"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - MEMORY_DIR=/memory
+      - CHROMA_DIR=/chroma
+    volumes:
+      - ./memory:/memory
+      - ./chroma:/chroma
+    networks:
+      - securebot
+    ports:
+      - "8400:8400"
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8400/health"]
       interval: 30s
       timeout: 10s
       retries: 3

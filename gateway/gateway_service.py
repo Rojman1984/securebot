@@ -126,20 +126,38 @@ class GatewayService:
     """
     Gateway service with Claude Code orchestration
     """
-    
+
     def __init__(self):
         self.vault_url = os.getenv("VAULT_URL", "http://vault:8200")
         self.ollama_url = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+        self.rag_url = os.getenv("RAG_URL", "http://rag-service:8400")
         self.config = get_config()
         self.search_detector = SearchDetector()
 
         # Initialize skill matcher for stats
         self.skill_matcher = SkillMatcher()
 
-        logger.info(f"Gateway initialized - Vault: {self.vault_url}, Ollama: {self.ollama_url}")
+        logger.info(f"Gateway initialized - Vault: {self.vault_url}, Ollama: {self.ollama_url}, RAG: {self.rag_url}")
         logger.info(f"Loaded {len(self.skill_matcher.skills)} total skills")
         logger.info(f"Search providers available: {self.search_detector.get_available_providers()}")
-    
+
+    async def _store_conversation(self, user_msg: str, bot_response: str):
+        """Store conversation turn in RAG service for future context retrieval"""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{self.rag_url}/embed/conversation",
+                    json={
+                        "user": user_msg[:500],  # Truncate long messages
+                        "assistant": bot_response[:500],
+                        "timestamp": datetime.now().isoformat()
+                    }
+                )
+                logger.debug("Conversation stored in RAG")
+        except Exception as e:
+            # Non-critical - don't fail on this
+            logger.debug(f"Failed to store conversation in RAG: {e}")
+
     async def process_message(self, message: Message) -> Dict[str, Any]:
         """
         Main message processing pipeline with orchestration
@@ -179,11 +197,15 @@ class GatewayService:
             
             # Calculate processing time
             elapsed = (datetime.now() - start_time).total_seconds()
-            
+
+            # Store conversation in RAG (non-blocking, best-effort)
+            bot_response = orchestrator_result["result"]
+            await self._store_conversation(message.text, bot_response)
+
             # Step 3: Build response
             return {
                 "status": "success",
-                "response": orchestrator_result["result"],
+                "response": bot_response,
                 "metadata": {
                     "engine": orchestrator_result["engine"],
                     "method": orchestrator_result["method"],

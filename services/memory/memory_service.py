@@ -12,11 +12,17 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 import json
 import os
+import httpx
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="SecureBot Memory Service")
 
 # Configuration
 MEMORY_DIR = os.getenv("MEMORY_DIR", "/home/tasker0/securebot/memory")
+RAG_URL = os.getenv("RAG_URL", "http://rag-service:8400")
 SOUL_FILE = f"{MEMORY_DIR}/soul.md"
 USER_FILE = f"{MEMORY_DIR}/user.md"
 SESSION_FILE = f"{MEMORY_DIR}/session.md"
@@ -68,6 +74,20 @@ def write_file(filepath: str, content: str):
             f.write(content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def trigger_reembedding():
+    """Trigger RAG service to re-embed memory after updates"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{RAG_URL}/embed/memory")
+            if response.status_code == 200:
+                logger.info("RAG re-embedding triggered successfully")
+            else:
+                logger.warning(f"RAG re-embedding failed: HTTP {response.status_code}")
+    except Exception as e:
+        # Non-critical - log but don't fail the memory update
+        logger.warning(f"Could not trigger RAG re-embedding: {e}")
 
 
 def read_json(filepath: str) -> Dict[str, Any]:
@@ -151,6 +171,9 @@ async def update_session(update: SessionUpdate):
 
             content = '\n'.join(new_lines)
             write_file(SESSION_FILE, content)
+
+        # Trigger RAG re-embedding after memory update
+        await trigger_reembedding()
 
         return {"status": "updated", "timestamp": datetime.now().isoformat()}
     except Exception as e:

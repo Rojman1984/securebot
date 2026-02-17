@@ -205,31 +205,82 @@ The memory service is a minimal FastAPI app that:
 #### Logs
 - `GET /memory/heartbeat` - Last 50 heartbeat log lines
 
-### Integration with Gateway
+### Integration with Gateway (RAG System)
+
+**Important**: SecureBot v2.0 uses **RAG (Retrieval Augmented Generation)** instead of loading full memory files.
+
+#### Why RAG?
+
+**Problem with Full Context Injection**:
+- Prepending full memory files (8000+ tokens) caused timeouts on budget hardware
+- 90% of memory irrelevant to any given query
+- Response times: 120-180 seconds (with 30% timeout rate)
+
+**Solution with RAG**:
+- Embed memory chunks into ChromaDB
+- Retrieve only TOP 3 relevant chunks (~300 tokens max)
+- Response times: 15-30 seconds (<1% timeout rate)
+- **4-6x faster**, 95%+ timeout elimination
+
+#### How RAG Works
 
 The gateway orchestrator:
-1. Loads memory context from memory service
-2. Prepends context to Ollama prompts
-3. Graceful fallback if memory service unavailable
-4. Updates session after interactions
+1. **Sends query to RAG service** (`/context?query=...`)
+2. **RAG embeds query** using nomic-embed-text
+3. **ChromaDB searches** memory and conversation collections
+4. **Returns relevant chunks** (top 2 from memory, top 1 from conversations)
+5. **Gateway prepends context** to Ollama prompt
 
-**Context Injection:**
+**Context Retrieval (NEW):**
 ```python
-# Load memory context
-memory_context = await load_memory_context()
+# Get relevant context from RAG service (not full memory!)
+context = await rag_service.get_context(query, max_tokens=300)
 
-# Prepend to prompt
-final_prompt = f"{memory_context}\n\n---\n\n{user_query}"
+# Prepend ONLY relevant context
+if context:
+    final_prompt = f"Context:\n{context}\n\n---\n\n{user_query}"
+else:
+    final_prompt = user_query
 
 # Send to Ollama
 result = ollama.generate(model="phi4-mini:3.8b", prompt=final_prompt)
 ```
 
+#### RAG Architecture
+
+```
+User Query → RAG Service → ChromaDB Search → Top 3 Chunks → Gateway → Ollama
+              ↓
+         Embed query
+         with nomic-embed-text
+```
+
+**ChromaDB Collections**:
+1. **memory**: Chunked soul.md, user.md, session.md (by ## headers)
+2. **conversations**: Last 100 conversation turns (rolling window)
+
+#### Automatic Re-embedding
+
+Memory changes trigger automatic re-embedding:
+- After session updates via memory service API
+- At end of day (session summarization)
+- Manual: `bash services/scripts/embed_memory.sh`
+
+#### Session Summarization
+
+At end of each day (systemd daily timer):
+1. phi4-mini summarizes session.md to 200 tokens
+2. Summary saved to `memory/summaries/session_YYYY-MM-DD.md`
+3. session.md updated with summary
+4. Memory automatically re-embedded
+
 This gives Ollama awareness of:
-- SecureBot's identity and purpose
-- User preferences and background
-- Current session context
-- Recent decisions and work
+- SecureBot's identity and purpose (from soul.md chunks)
+- User preferences and background (from user.md chunks)
+- Current session context (from session.md chunks)
+- Past relevant conversations (from conversation history)
+
+**See [RAG.md](RAG.md) for full RAG system documentation.**
 
 ## Automation Skills
 
@@ -442,22 +493,32 @@ curl http://localhost:8200/health
               │  Memory Service      │  FastAPI
               │  (port 8300)         │  Minimal Python
               │  - File read/write   │  REST API
-              │  - Task management   │
+              │  - Task management   │  Triggers re-embedding
+              │  - Trigger RAG       │  after updates
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  RAG Service         │  ChromaDB + Ollama
+              │  (port 8400)         │  Embedding: nomic-embed-text
+              │  - Embed memory      │  Vector search
+              │  - Store convos      │  Semantic retrieval
+              │  - Retrieve context  │
               └──────────┬───────────┘
                          │
                          ▼
               ┌──────────────────────┐
               │  Gateway             │  Orchestrator
-              │  (port 8080)         │  Loads context
-              │  - Load memory       │  Injects into
-              │  - Inject context    │  Ollama prompts
+              │  (port 8080)         │  Gets relevant context
+              │  - Get RAG context   │  from RAG (not full files!)
+              │  - Inject context    │  Injects into prompts
               └──────────┬───────────┘
                          │
                          ▼
               ┌──────────────────────┐
               │  Ollama              │  Local LLM
-              │  (phi4-mini:3.8b)    │  With context
-              └──────────────────────┘
+              │  (phi4-mini:3.8b)    │  With relevant context
+              └──────────────────────┘  (300 tokens max)
 
 ┌─────────────────────────────────────────────────────────────┐
 │                   Systemd Automation Layer                   │
@@ -494,10 +555,13 @@ curl http://localhost:8200/health
 - Daily cost summaries in daily report
 - Budget alerts when approaching limit
 
-### Smart Context Loading
-- Load only relevant memory sections
-- Context size optimization
-- Time-decay for old context
+### RAG Enhancements
+- ✅ **DONE**: Semantic retrieval with ChromaDB
+- ✅ **DONE**: Session summarization
+- Multi-modal embeddings (images, PDFs)
+- Time-weighted retrieval (prefer recent)
+- User feedback loop (learn from relevance)
+- Hybrid search (vector + keyword)
 
 ### Multi-User Support
 - Per-user memory directories

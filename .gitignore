@@ -57,6 +57,10 @@ memory/heartbeat.log
 memory/hourly.log
 memory/daily.log
 memory/archive/
+memory/summaries/
+
+# ChromaDB - Vector database (user-specific, NEVER commit)
+chroma/
 
 # Keep these (safe to commit)
 !memory/templates/

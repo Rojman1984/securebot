@@ -52,4 +52,12 @@ fi
 # Generate cost summary if available
 # TODO: Implement cost tracking from gateway logs
 
+# Summarize session at end of day
+echo "Summarizing session..."
+if curl -s -f -X POST http://localhost:8400/summarize/session > /dev/null 2>&1; then
+    echo "Session summarized and re-embedded"
+else
+    echo "Warning: Session summarization failed (RAG service may be unavailable)"
+fi
+
 echo "---" >> "$MEMORY_DIR/daily.log"
