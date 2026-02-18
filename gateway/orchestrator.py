@@ -192,10 +192,10 @@ class SkillMatcher:
 
 
 class IntentClassifier:
-    """Classify query intent: ACTION vs KNOWLEDGE"""
+    """Classify query intent: ACTION vs KNOWLEDGE with hybrid LLM disambiguation"""
 
-    # KNOWLEDGE intent patterns - questions seeking information/explanation
-    KNOWLEDGE_PATTERNS = [
+    # High-confidence KNOWLEDGE patterns - unambiguous questions
+    KNOWLEDGE_PATTERNS_HIGH = [
         # Question starters
         "explain", "what is", "what are", "what do", "what does",
         "why", "why is", "why are", "why do", "why does",
@@ -207,7 +207,7 @@ class IntentClassifier:
 
         # Comparative/informational
         "difference between", "differences between",
-        "what's the difference", "compare",
+        "what's the difference",
         "what does X mean", "what do X mean",
         "meaning of", "purpose of",
 
@@ -218,54 +218,183 @@ class IntentClassifier:
         "tell me", "show me what"
     ]
 
-    # ACTION intent patterns - requests to create/build/do something
-    ACTION_PATTERNS = [
-        # Creation/generation
-        "create", "make", "build", "generate", "write",
-        "develop", "design", "implement", "code",
+    # High-confidence ACTION patterns - unambiguous action requests
+    ACTION_PATTERNS_HIGH = [
+        # Unambiguous creation/execution
+        "reverse", "encrypt", "decode", "decrypt", "hash",
+        "parse", "convert", "transform", "execute",
+        "run", "perform",
+        "schedule", "automate", "set up", "setup",
+        "configure", "install", "deploy",
+        "write a script", "generate a script",
 
         # Modification
         "fix", "update", "change", "modify", "edit",
         "refactor", "optimize", "improve", "enhance",
-
-        # Execution/automation
-        "run", "execute", "perform", "do",
-        "schedule", "automate", "set up", "setup",
-        "configure", "install",
-
-        # Data operations
-        "reverse", "convert", "transform", "process",
-        "analyze and extract", "parse",
 
         # Search/retrieval (when action-oriented)
         "search for", "find me", "look up", "get me",
         "fetch", "retrieve", "pull"
     ]
 
+    # Ambiguous verbs - can be action OR knowledge depending on context
+    AMBIGUOUS_VERBS = [
+        "design", "develop", "implement", "build", "create",
+        "make", "write", "code", "compare"
+    ]
+
+    # Analytical signals - indicate knowledge intent even with ambiguous verbs
+    ANALYTICAL_SIGNALS = [
+        "trade-off", "trade-offs", "tradeoff", "tradeoffs",
+        "consider", "considering",
+        "pros and cons", "advantages and disadvantages",
+        "when to use", "when should",
+        "difference", "compare", "comparison",
+        "best practice", "best practices",
+        "why", "how does", "what is",
+        "explain", "describe",
+        "architecture", "strategy", "approach",
+        "pattern", "patterns",
+        "philosophy", "principles"
+    ]
+
     @staticmethod
-    def classify_intent(query: str) -> str:
+    def classify_intent(query: str) -> tuple[str, str]:
         """
-        Classify query intent
+        Classify query intent with confidence scoring
 
         Returns:
-            "knowledge" - Query seeks information/explanation (→ Ollama)
-            "action" - Query requests action/creation (→ Skills or Claude)
-            "ambiguous" - Unclear (default to Ollama for safety/cost)
+            Tuple of (intent, confidence) where:
+            - intent: "knowledge" or "action"
+            - confidence: "high" or "ambiguous"
         """
         query_lower = query.lower().strip()
 
-        # Check KNOWLEDGE patterns first (higher priority)
-        for pattern in IntentClassifier.KNOWLEDGE_PATTERNS:
+        # Check high-confidence KNOWLEDGE patterns first
+        for pattern in IntentClassifier.KNOWLEDGE_PATTERNS_HIGH:
             if query_lower.startswith(pattern) or f" {pattern}" in f" {query_lower}":
+                return ("knowledge", "high")
+
+        # Check for analytical signals (knowledge even with action verbs)
+        has_analytical = any(signal in query_lower for signal in IntentClassifier.ANALYTICAL_SIGNALS)
+
+        # Check for ambiguous verbs
+        has_ambiguous_verb = any(verb in query_lower for verb in IntentClassifier.AMBIGUOUS_VERBS)
+
+        # If has ambiguous verb + analytical signals = ambiguous (needs LLM)
+        if has_ambiguous_verb and has_analytical:
+            return ("knowledge", "ambiguous")
+
+        # Check high-confidence ACTION patterns
+        for pattern in IntentClassifier.ACTION_PATTERNS_HIGH:
+            if query_lower.startswith(pattern):
+                return ("action", "high")
+
+        # If has ambiguous verb without analytical signals = likely action
+        if has_ambiguous_verb:
+            return ("action", "high")
+
+        # Default to knowledge (safer/cheaper)
+        return ("knowledge", "high")
+
+
+async def classify_with_ollama(query: str, ollama_url: str, rag_url: str, signed_client: Optional[Any] = None) -> str:
+    """
+    Fast LLM classification for ambiguous queries using few-shot examples from ChromaDB.
+
+    Uses minimal tokens for quick classification (~3-5s on phi4-mini).
+
+    Args:
+        query: The user query to classify
+        ollama_url: Ollama service URL
+        rag_url: RAG service URL for fetching examples
+        signed_client: Optional SignedClient for authenticated requests
+
+    Returns:
+        "action" or "knowledge"
+    """
+    # Fetch similar examples from RAG service
+    examples = []
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            url = f"{rag_url}/classify/examples"
+            params = {"query": query, "k": 3}
+
+            if signed_client:
+                response = await signed_client.get(client, url, params=params)
+            else:
+                response = await client.get(url, params=params)
+
+            if response.status_code == 200:
+                data = response.json()
+                examples = data.get("examples", [])
+                if examples:
+                    logger.info(f"Retrieved {len(examples)} few-shot examples from RAG")
+            else:
+                logger.warning(f"Failed to fetch examples: HTTP {response.status_code}")
+    except Exception as e:
+        logger.warning(f"Failed to fetch few-shot examples: {e}, falling back to zero-shot")
+
+    # Build prompt - few-shot if examples available, zero-shot otherwise
+    if examples:
+        # Build few-shot prompt
+        system_prompt = """You are a query intent classifier.
+ACTION = user wants a specific artifact, script, transformation, or execution
+KNOWLEDGE = user wants explanation, analysis, comparison, or architectural guidance
+
+Examples:"""
+
+        for ex in examples:
+            system_prompt += f"\nQ: {ex['query']}\nA: {ex['label']}\n"
+
+        system_prompt += "\nReply with only one word: ACTION or KNOWLEDGE"
+        full_prompt = f"{system_prompt}\n\nQ: {query}\nA:"
+        logger.info("Using few-shot classification prompt")
+    else:
+        # Fallback to zero-shot
+        system_prompt = """You are a query classifier. Classify the query as exactly one of:
+
+ACTION - user wants you to create, build, execute, or produce something specific (code, script, file, output)
+KNOWLEDGE - user wants explanation, analysis, comparison, discussion, or theoretical understanding
+
+Reply with only the single word: ACTION or KNOWLEDGE"""
+        full_prompt = f"{system_prompt}\n\nQuery: {query}\n\nClassification:"
+        logger.info("Using zero-shot classification prompt (no examples available)")
+
+    try:
+        logger.info("🔍 Using LLM for ambiguous query classification")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": "phi4-mini:3.8b",
+                    "prompt": full_prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": 5,  # Only need one word
+                        "temperature": 0.1,  # Low temperature for deterministic output
+                        "top_p": 0.9
+                    }
+                }
+            )
+
+            data = response.json()
+            result = data.get("response", "").strip().upper()
+
+            # Parse result - look for ACTION or KNOWLEDGE
+            if "ACTION" in result:
+                logger.info("✓ LLM classified as: ACTION")
+                return "action"
+            elif "KNOWLEDGE" in result:
+                logger.info("✓ LLM classified as: KNOWLEDGE")
+                return "knowledge"
+            else:
+                logger.warning(f"LLM returned unexpected result: {result}, defaulting to KNOWLEDGE")
                 return "knowledge"
 
-        # Check ACTION patterns
-        for pattern in IntentClassifier.ACTION_PATTERNS:
-            if query_lower.startswith(pattern):
-                return "action"
-
-        # Ambiguous - default to knowledge (safer/cheaper)
-        return "knowledge"
+    except Exception as e:
+        logger.warning(f"LLM classification failed: {e}, defaulting to KNOWLEDGE")
+        return "knowledge"  # Graceful fallback
 
 
 class ComplexityClassifier:
@@ -486,7 +615,7 @@ Generate the complete SKILL.md now:
     async def get_relevant_context(self, query: str, max_tokens: int = 300) -> str:
         """Get relevant context from RAG service (NEW - replaces full memory loading)"""
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 url = f"{self.rag_url}/context"
                 params = {"query": query, "max_tokens": max_tokens}
 
@@ -650,9 +779,18 @@ async def route_query(
             "engine": "ollama"
         }
 
-    # Step 1: Classify intent - KNOWLEDGE queries skip skill matching entirely
-    intent = IntentClassifier.classify_intent(query)
-    logger.info(f"Intent classification: {intent}")
+    # Step 1: Classify intent with confidence scoring
+    intent, confidence = IntentClassifier.classify_intent(query)
+    logger.info(f"Intent classification: {intent} (confidence: {confidence})")
+
+    # Step 1b: Use LLM for ambiguous cases
+    if confidence == "ambiguous":
+        logger.info(f"⚠️  Ambiguous query detected, invoking LLM classifier")
+        # Create temporary orchestrator to get signed_client
+        temp_orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
+        rag_url = temp_orchestrator.rag_url
+        intent = await classify_with_ollama(query, ollama_url, rag_url, temp_orchestrator.signed_client)
+        logger.info(f"LLM resolved intent: {intent}")
 
     # If KNOWLEDGE intent, bypass all skill logic and go directly to Ollama
     if intent == "knowledge":
@@ -792,9 +930,39 @@ async def route_query(
         }
 
 
+async def seed_classifier_examples_on_startup(rag_url: str, signed_client: Optional[Any] = None):
+    """
+    Seed classifier examples collection on gateway startup.
+    Runs in background, does not block startup.
+    """
+    try:
+        logger.info("Attempting to seed classifier examples...")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            url = f"{rag_url}/classify/seed"
+
+            if signed_client:
+                response = await signed_client.post(client, url, json={})
+            else:
+                response = await client.post(url, json={})
+
+            if response.status_code == 200:
+                data = response.json()
+                seeded = data.get("seeded", 0)
+                if seeded > 0:
+                    logger.info(f"✓ Seeded {seeded} classifier examples")
+                else:
+                    logger.info("Classifier examples already seeded")
+            else:
+                logger.warning(f"Failed to seed classifier examples: HTTP {response.status_code}")
+
+    except Exception as e:
+        logger.warning(f"Failed to seed classifier examples: {e}")
+        # Graceful failure - don't block startup
+
+
 if __name__ == "__main__":
     import asyncio
-    
+
     # Test the orchestrator
     async def test():
         result = await route_query(
@@ -802,5 +970,5 @@ if __name__ == "__main__":
             "test_user"
         )
         print(json.dumps(result, indent=2))
-    
+
     asyncio.run(test())

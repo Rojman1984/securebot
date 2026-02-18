@@ -50,6 +50,10 @@ conversation_collection = chroma_client.get_or_create_collection(
     name="conversations",
     metadata={"hnsw:space": "cosine"}
 )
+classifier_collection = chroma_client.get_or_create_collection(
+    name="classifier_examples",
+    metadata={"hnsw:space": "cosine"}
+)
 
 
 # Request models
@@ -179,12 +183,14 @@ async def health_check():
     try:
         memory_count = memory_collection.count()
         conversation_count = conversation_collection.count()
+        classifier_count = classifier_collection.count()
 
         return {
             "status": "healthy",
             "embedding_model": EMBEDDING_MODEL,
             "memory_chunks": memory_count,
             "conversations": conversation_count,
+            "classifier_examples": classifier_count,
             "chroma_path": str(CHROMA_DIR)
         }
     except Exception as e:
@@ -313,6 +319,222 @@ async def get_context(
             "sources": [],
             "error": str(e)
         }
+
+
+@app.get("/classify/examples")
+async def get_classifier_examples(
+    query: str,
+    k: int = 3,
+    request: Request = None,
+    _auth = Depends(auth_required)
+):
+    """
+    Get k nearest neighbor examples for query classification.
+    Requires HMAC authentication.
+
+    Args:
+        query: The query to find similar examples for
+        k: Number of examples to return (default 3)
+
+    Returns:
+        {"examples": [{"query": "...", "label": "ACTION|KNOWLEDGE", "reason": "..."}]}
+    """
+    try:
+        # Check if collection is empty
+        if classifier_collection.count() == 0:
+            print("Classifier examples collection is empty")
+            return {"examples": []}
+
+        # Get embedding for query
+        query_embedding = await get_ollama_embedding(query)
+
+        # Search for k nearest neighbors
+        results = classifier_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(k, classifier_collection.count())
+        )
+
+        # Format results
+        examples = []
+        if results and results['metadatas']:
+            for metadata in results['metadatas'][0]:
+                examples.append({
+                    "query": metadata['query'],
+                    "label": metadata['label'],
+                    "reason": metadata['reason']
+                })
+
+        return {"examples": examples}
+
+    except Exception as e:
+        # Graceful fallback - return empty list
+        print(f"Classifier examples retrieval error: {e}")
+        return {"examples": []}
+
+
+@app.post("/classify/seed")
+async def seed_classifier_examples(
+    request: Request
+):
+    """
+    Seed the classifier_examples collection with hardcoded examples.
+    Idempotent - only seeds if collection is empty.
+    Requires HMAC authentication.
+
+    Returns:
+        {"status": "ok", "seeded": N}
+    """
+    try:
+        # Check if already seeded
+        if classifier_collection.count() > 0:
+            print("Classifier examples already seeded")
+            return {"status": "ok", "seeded": 0, "message": "Already seeded"}
+
+        # Define seed examples from CLASSIFIER_RUBRIC.md
+        seed_examples = [
+            # KNOWLEDGE examples
+            {
+                "query": "Design a scalable microservices architecture for e-commerce. Consider trade-offs between consistency and availability.",
+                "label": "KNOWLEDGE",
+                "reason": "Asks for architectural guidance and trade-off analysis, not a deliverable artifact."
+            },
+            {
+                "query": "What are the pros and cons of using Redis vs Memcached for session storage?",
+                "label": "KNOWLEDGE",
+                "reason": "Comparison of technologies, no artifact requested."
+            },
+            {
+                "query": "Explain how Python list comprehensions work with nested loops.",
+                "label": "KNOWLEDGE",
+                "reason": "Explanation of a concept."
+            },
+            {
+                "query": "How does consistent hashing work and when should I use it?",
+                "label": "KNOWLEDGE",
+                "reason": "Conceptual explanation with usage guidance."
+            },
+            {
+                "query": "Should I use Kubernetes or Docker Swarm for a small team?",
+                "label": "KNOWLEDGE",
+                "reason": "Decision guidance, no artifact."
+            },
+            {
+                "query": "Implement a rate limiting strategy. Consider sliding window vs token bucket trade-offs.",
+                "label": "KNOWLEDGE",
+                "reason": "Consider trade-offs signals analysis, not a specific implementation."
+            },
+            {
+                "query": "Build a mental model for CI/CD pipelines",
+                "label": "KNOWLEDGE",
+                "reason": "Mental model = conceptual understanding, not a pipeline."
+            },
+            {
+                "query": "Create a strategy for caching that handles cache stampede and invalidation",
+                "label": "KNOWLEDGE",
+                "reason": "Strategy = analysis and guidance, not an artifact."
+            },
+            {
+                "query": "What are best practices for securing a FastAPI application?",
+                "label": "KNOWLEDGE",
+                "reason": "Best practices discussion, no code artifact requested."
+            },
+            {
+                "query": "What are the trade-offs between monolith and microservices for a startup?",
+                "label": "KNOWLEDGE",
+                "reason": "Architectural trade-off analysis."
+            },
+
+            # ACTION examples
+            {
+                "query": "Reverse the string hello world",
+                "label": "ACTION",
+                "reason": "Specific transformation of specific input requested."
+            },
+            {
+                "query": "Create a systemd timer that runs a backup script every day at 2am",
+                "label": "ACTION",
+                "reason": "Specific artifact (timer unit file) to produce."
+            },
+            {
+                "query": "Write a bash script to monitor disk usage and alert when above 90%",
+                "label": "ACTION",
+                "reason": "Specific script artifact requested."
+            },
+            {
+                "query": "Build a Python function that parses a CSV and returns a dict",
+                "label": "ACTION",
+                "reason": "Specific code artifact to produce."
+            },
+            {
+                "query": "Generate an Ansible playbook to install nginx on Ubuntu",
+                "label": "ACTION",
+                "reason": "Specific playbook artifact to produce."
+            },
+            {
+                "query": "Convert this JSON to YAML: {name: roland, role: admin}",
+                "label": "ACTION",
+                "reason": "Specific data transformation with given input."
+            },
+            {
+                "query": "Create a Docker Compose file for a Python app with PostgreSQL",
+                "label": "ACTION",
+                "reason": "Specific file artifact requested."
+            },
+            {
+                "query": "Write a systemd service unit for a FastAPI application",
+                "label": "ACTION",
+                "reason": "Specific configuration file to produce."
+            },
+            {
+                "query": "Implement a binary search function in Python",
+                "label": "ACTION",
+                "reason": "Specific code artifact, not a conceptual explanation."
+            },
+            {
+                "query": "Design a Python class for a rate limiter with token bucket algorithm",
+                "label": "ACTION",
+                "reason": "Design a class = produce specific code."
+            },
+            {
+                "query": "Implement rate limiting in my FastAPI app",
+                "label": "ACTION",
+                "reason": "In my app = produce middleware/code for a specific system."
+            },
+            {
+                "query": "Build a CI/CD pipeline for a Python project",
+                "label": "ACTION",
+                "reason": "Specific pipeline artifact/config to produce."
+            }
+        ]
+
+        # Embed and store each example
+        seeded_count = 0
+        for example in seed_examples:
+            try:
+                # Get embedding for query
+                embedding = await get_ollama_embedding(example["query"])
+
+                # Store in collection
+                classifier_collection.add(
+                    embeddings=[embedding],
+                    documents=[example["query"]],
+                    metadatas=[{
+                        "query": example["query"],
+                        "label": example["label"],
+                        "reason": example["reason"]
+                    }],
+                    ids=[f"example_{seeded_count}_{datetime.now().timestamp()}"]
+                )
+                seeded_count += 1
+            except Exception as e:
+                print(f"Failed to seed example: {example['query'][:50]}... Error: {e}")
+                continue
+
+        print(f"Seeded {seeded_count} classifier examples")
+        return {"status": "ok", "seeded": seeded_count}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/summarize/session")

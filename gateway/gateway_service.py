@@ -298,6 +298,21 @@ class GatewayService:
 gateway = GatewayService()
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Seed classifier examples on startup"""
+    import asyncio
+    from orchestrator import seed_classifier_examples_on_startup
+
+    # Run seeding in background (non-blocking)
+    asyncio.create_task(
+        seed_classifier_examples_on_startup(
+            rag_url=os.getenv("RAG_URL", "http://rag-service:8400"),
+            signed_client=gateway.signed_client
+        )
+    )
+
+
 @app.post("/message")
 async def handle_message(message: Message) -> Dict[str, Any]:
     """
