@@ -18,6 +18,9 @@ import httpx
 import yaml
 from datetime import datetime
 
+RESPONSE_MODEL = os.getenv('RESPONSE_MODEL', 'llama3:8b')
+CLASSIFIER_MODEL = os.getenv('CLASSIFIER_MODEL', 'phi4-mini:3.8b')
+
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -396,7 +399,7 @@ async def classify_with_ollama_local(prompt: str, ollama_url: str) -> str:
             response = await client.post(
                 f"{ollama_url}/api/generate",
                 json={
-                    "model": "phi4-mini:3.8b",
+                    "model": CLASSIFIER_MODEL,
                     "prompt": prompt,
                     "stream": False,
                     "options": {
@@ -747,7 +750,8 @@ Generate the complete SKILL.md now:
         skill: Dict[str, Any],
         query: str,
         arguments: str,
-        ollama_url: str
+        ollama_url: str,
+        system_prompt: Optional[str] = None
     ) -> str:
         """Execute skill with Ollama"""
         logger.info(f"Executing skill: {skill['name']}")
@@ -782,8 +786,9 @@ Generate the complete SKILL.md now:
                 response = await client.post(
                     f"{ollama_url}/api/generate",
                     json={
-                        "model": "phi4-mini:3.8b",
+                        "model": RESPONSE_MODEL,
                         "prompt": final_prompt,
+                        "system": system_prompt or "",
                         "stream": False
                     }
                 )
@@ -835,7 +840,8 @@ async def route_query(
     vault_url: str = "http://vault:8200",
     ollama_url: str = "http://host.docker.internal:11434",
     has_search_results: bool = False,
-    memory_service_url: Optional[str] = None
+    memory_service_url: Optional[str] = None,
+    system_prompt: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Main routing logic for intelligent query handling.
@@ -865,7 +871,12 @@ async def route_query(
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{ollama_url}/api/generate",
-                json={"model": "phi4-mini:3.8b", "prompt": enhanced_query, "stream": False}
+                json={
+                    "model": RESPONSE_MODEL,
+                    "prompt": enhanced_query,
+                    "system": system_prompt or "",
+                    "stream": False
+                }
             )
             result = response.json().get("response", "")
 
@@ -920,7 +931,12 @@ async def route_query(
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{ollama_url}/api/generate",
-                json={"model": "phi4-mini:3.8b", "prompt": enhanced_query, "stream": False}
+                json={
+                    "model": RESPONSE_MODEL,
+                    "prompt": enhanced_query,
+                    "system": system_prompt or "",
+                    "stream": False
+                }
             )
             result = response.json().get("response", "")
 
@@ -961,7 +977,7 @@ async def route_query(
         logger.info(f"Matched skill: {matching_skill['name']}")
 
     if complexity == "skill_execution":
-        result = await orchestrator.execute_skill(matching_skill, query, query, ollama_url)
+        result = await orchestrator.execute_skill(matching_skill, query, query, ollama_url, system_prompt)
         return {
             "result": result,
             "method": "skill_execution",
@@ -974,7 +990,7 @@ async def route_query(
     elif complexity == "skill_creation":
         logger.info("Creating new skill (this costs $$)")
         skill = await orchestrator.create_skill(query, purpose=query)
-        result = await orchestrator.execute_skill(skill, query, query, ollama_url)
+        result = await orchestrator.execute_skill(skill, query, query, ollama_url, system_prompt)
         return {
             "result": result,
             "method": "skill_creation",
@@ -1004,7 +1020,12 @@ async def route_query(
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{ollama_url}/api/generate",
-                json={"model": "phi4-mini:3.8b", "prompt": enhanced_query, "stream": False}
+                json={
+                    "model": RESPONSE_MODEL,
+                    "prompt": enhanced_query,
+                    "system": system_prompt or "",
+                    "stream": False
+                }
             )
             result = response.json().get("response", "")
 

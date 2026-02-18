@@ -194,6 +194,50 @@ class TavilySearch(SearchProvider):
             return results
 
 
+class BraveSearch(SearchProvider):
+    """
+    Brave Search API Provider
+    Best for: Privacy-focused searches, independent index
+    """
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.name = "brave"
+
+    async def search(self, query: str, max_results: int = 10) -> List[Dict[str, str]]:
+        """Execute Brave Search"""
+        url = "https://api.search.brave.com/res/v1/web/search"
+        params = {
+            "q": query,
+            "count": min(max_results, 20)
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                url,
+                params=params,
+                headers={"X-Subscription-Token": self.api_key}
+            )
+
+            if response.status_code == 429:
+                raise Exception("Rate limit exceeded")
+
+            if response.status_code != 200:
+                raise Exception(f"HTTP {response.status_code}: {response.text}")
+
+            data = response.json()
+            results = []
+
+            for item in data.get("web", {}).get("results", []):
+                results.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "snippet": item.get("description", "")
+                })
+
+            return results
+
+
 class DuckDuckGoSearch(SearchProvider):
     """
     DuckDuckGo Search Provider
@@ -269,6 +313,17 @@ class SearchOrchestrator:
                 "priority": self.user_config.get_skill_priority("search-tavily", 2)
             })
             logger.info(f"Tavily Search provider initialized (priority: {self.providers[-1]['priority']})")
+
+        # Initialize Brave Search if configured AND enabled
+        if (config.get("brave_api_key") and
+            self.user_config.is_skill_enabled("search-brave")):
+
+            self.providers.append({
+                "provider": BraveSearch(config["brave_api_key"]),
+                "name": "brave",
+                "priority": config.get("brave_priority", 1)
+            })
+            logger.info(f"Brave Search provider initialized (priority: {self.providers[-1]['priority']})")
 
         # Always have DuckDuckGo as fallback if enabled (enabled by default)
         if self.user_config.is_skill_enabled("search-duckduckgo"):

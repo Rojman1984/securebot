@@ -42,6 +42,7 @@ class Message(BaseModel):
     user_id: str
     text: str
     metadata: Optional[Dict[str, Any]] = {}
+    system: Optional[str] = None
 
 
 class SearchDetector:
@@ -203,7 +204,8 @@ class GatewayService:
                 user_id=message.user_id,
                 vault_url=self.vault_url,
                 ollama_url=self.ollama_url,
-                has_search_results=has_search_results
+                has_search_results=has_search_results,
+                system_prompt=message.system
             )
             
             # Calculate processing time
