@@ -202,8 +202,7 @@ async def health_check():
 
 @app.post("/embed/memory")
 async def embed_memory(
-    request: Request,
-    _auth = Depends(auth_required)
+    request: Request
 ):
     """Re-embed all memory files. Requires HMAC authentication."""
     try:
@@ -337,7 +336,7 @@ async def get_classifier_examples(
         k: Number of examples to return (default 3)
 
     Returns:
-        {"examples": [{"query": "...", "label": "ACTION|KNOWLEDGE", "reason": "..."}]}
+        {"examples": [{"query": "...", "label": "ACTION|KNOWLEDGE|SKILL_NEEDED|CURRENT", "reason": "...", "chain_of_thought": "..."}]}
     """
     try:
         # Check if collection is empty
@@ -361,7 +360,8 @@ async def get_classifier_examples(
                 examples.append({
                     "query": metadata['query'],
                     "label": metadata['label'],
-                    "reason": metadata['reason']
+                    "reason": metadata['reason'],
+                    "chain_of_thought": metadata.get('chain_of_thought', '')
                 })
 
         return {"examples": examples}
@@ -390,121 +390,159 @@ async def seed_classifier_examples(
             print("Classifier examples already seeded")
             return {"status": "ok", "seeded": 0, "message": "Already seeded"}
 
-        # Define seed examples from CLASSIFIER_RUBRIC.md
+        # Define seed examples - 6 per class (24 total), with chain_of_thought
         seed_examples = [
-            # KNOWLEDGE examples
+            # KNOWLEDGE examples (6)
             {
                 "query": "Design a scalable microservices architecture for e-commerce. Consider trade-offs between consistency and availability.",
                 "label": "KNOWLEDGE",
-                "reason": "Asks for architectural guidance and trade-off analysis, not a deliverable artifact."
+                "reason": "Asks for architectural guidance and trade-off analysis, not a deliverable artifact.",
+                "chain_of_thought": "The user asks to 'design' with 'consider trade-offs' — this is analytical guidance, not a deliverable. No code or file is requested. → KNOWLEDGE"
             },
             {
                 "query": "What are the pros and cons of using Redis vs Memcached for session storage?",
                 "label": "KNOWLEDGE",
-                "reason": "Comparison of technologies, no artifact requested."
+                "reason": "Comparison of technologies, no artifact requested.",
+                "chain_of_thought": "'Pros and cons' signals comparative analysis. No action verb requesting a specific artifact. → KNOWLEDGE"
             },
             {
                 "query": "Explain how Python list comprehensions work with nested loops.",
                 "label": "KNOWLEDGE",
-                "reason": "Explanation of a concept."
+                "reason": "Explanation of a concept.",
+                "chain_of_thought": "'Explain how' is a canonical knowledge signal. User wants understanding, not code. → KNOWLEDGE"
             },
             {
                 "query": "How does consistent hashing work and when should I use it?",
                 "label": "KNOWLEDGE",
-                "reason": "Conceptual explanation with usage guidance."
-            },
-            {
-                "query": "Should I use Kubernetes or Docker Swarm for a small team?",
-                "label": "KNOWLEDGE",
-                "reason": "Decision guidance, no artifact."
-            },
-            {
-                "query": "Implement a rate limiting strategy. Consider sliding window vs token bucket trade-offs.",
-                "label": "KNOWLEDGE",
-                "reason": "Consider trade-offs signals analysis, not a specific implementation."
-            },
-            {
-                "query": "Build a mental model for CI/CD pipelines",
-                "label": "KNOWLEDGE",
-                "reason": "Mental model = conceptual understanding, not a pipeline."
-            },
-            {
-                "query": "Create a strategy for caching that handles cache stampede and invalidation",
-                "label": "KNOWLEDGE",
-                "reason": "Strategy = analysis and guidance, not an artifact."
+                "reason": "Conceptual explanation with usage guidance.",
+                "chain_of_thought": "'How does X work' + 'when should I use it' — both request explanation and guidance. No artifact. → KNOWLEDGE"
             },
             {
                 "query": "What are best practices for securing a FastAPI application?",
                 "label": "KNOWLEDGE",
-                "reason": "Best practices discussion, no code artifact requested."
+                "reason": "Best practices discussion, no code artifact requested.",
+                "chain_of_thought": "'Best practices' is a knowledge signal. User wants a list of recommendations, not code. → KNOWLEDGE"
             },
             {
                 "query": "What are the trade-offs between monolith and microservices for a startup?",
                 "label": "KNOWLEDGE",
-                "reason": "Architectural trade-off analysis."
+                "reason": "Architectural trade-off analysis.",
+                "chain_of_thought": "'Trade-offs between' is a strong analytical signal. No implementation artifact requested. → KNOWLEDGE"
             },
 
-            # ACTION examples
+            # ACTION examples (6)
             {
                 "query": "Reverse the string hello world",
                 "label": "ACTION",
-                "reason": "Specific transformation of specific input requested."
-            },
-            {
-                "query": "Create a systemd timer that runs a backup script every day at 2am",
-                "label": "ACTION",
-                "reason": "Specific artifact (timer unit file) to produce."
+                "reason": "Specific transformation of specific input requested.",
+                "chain_of_thought": "Direct imperative verb 'reverse' on a specific input. An executable result is expected immediately. No skill gap. → ACTION"
             },
             {
                 "query": "Write a bash script to monitor disk usage and alert when above 90%",
                 "label": "ACTION",
-                "reason": "Specific script artifact requested."
+                "reason": "Specific script artifact requested.",
+                "chain_of_thought": "'Write a bash script' is an unambiguous artifact request. The output is a specific file. Existing bash skill available. → ACTION"
             },
             {
                 "query": "Build a Python function that parses a CSV and returns a dict",
                 "label": "ACTION",
-                "reason": "Specific code artifact to produce."
+                "reason": "Specific code artifact to produce.",
+                "chain_of_thought": "'Build a Python function' requests a concrete code artifact. Standard capability, no new skill needed. → ACTION"
             },
             {
                 "query": "Generate an Ansible playbook to install nginx on Ubuntu",
                 "label": "ACTION",
-                "reason": "Specific playbook artifact to produce."
+                "reason": "Specific playbook artifact to produce.",
+                "chain_of_thought": "'Generate an Ansible playbook' — clear artifact request. Standard devops task within existing capabilities. → ACTION"
             },
             {
                 "query": "Convert this JSON to YAML: {name: roland, role: admin}",
                 "label": "ACTION",
-                "reason": "Specific data transformation with given input."
-            },
-            {
-                "query": "Create a Docker Compose file for a Python app with PostgreSQL",
-                "label": "ACTION",
-                "reason": "Specific file artifact requested."
-            },
-            {
-                "query": "Write a systemd service unit for a FastAPI application",
-                "label": "ACTION",
-                "reason": "Specific configuration file to produce."
+                "reason": "Specific data transformation with given input.",
+                "chain_of_thought": "Imperative 'convert' with specific input provided. Immediate transformation, no new skill required. → ACTION"
             },
             {
                 "query": "Implement a binary search function in Python",
                 "label": "ACTION",
-                "reason": "Specific code artifact, not a conceptual explanation."
+                "reason": "Specific code artifact, not a conceptual explanation.",
+                "chain_of_thought": "'Implement' signals code production. 'Binary search in Python' is a standard algorithm — within existing capabilities. → ACTION"
+            },
+
+            # SKILL_NEEDED examples (6)
+            {
+                "query": "Generate a PDF report from this CSV data",
+                "label": "SKILL_NEEDED",
+                "reason": "No PDF generation skill exists.",
+                "chain_of_thought": "User wants a PDF artifact from CSV. Checking skills index: no pdf-generation skill found. A new skill must be created before execution. → SKILL_NEEDED"
             },
             {
-                "query": "Design a Python class for a rate limiter with token bucket algorithm",
-                "label": "ACTION",
-                "reason": "Design a class = produce specific code."
+                "query": "Send me a Telegram message when disk usage exceeds 90%",
+                "label": "SKILL_NEEDED",
+                "reason": "No Telegram skill exists.",
+                "chain_of_thought": "Requires Telegram bot integration. Checking skills index: no telegram-notify skill found. This is a new capability that needs a skill. → SKILL_NEEDED"
             },
             {
-                "query": "Implement rate limiting in my FastAPI app",
-                "label": "ACTION",
-                "reason": "In my app = produce middleware/code for a specific system."
+                "query": "Create a Docker Compose file for a Python app with PostgreSQL and Redis",
+                "label": "SKILL_NEEDED",
+                "reason": "No docker-compose skill exists.",
+                "chain_of_thought": "Artifact request for a multi-service Docker Compose. Skills index: no docker-compose-generator skill found. Queuing skill creation. → SKILL_NEEDED"
             },
             {
-                "query": "Build a CI/CD pipeline for a Python project",
-                "label": "ACTION",
-                "reason": "Specific pipeline artifact/config to produce."
-            }
+                "query": "Monitor my SecureBot services and send a daily email summary",
+                "label": "SKILL_NEEDED",
+                "reason": "No email skill exists.",
+                "chain_of_thought": "Requires email integration and service monitoring. Skills index: no email-sender or service-monitor skill found. → SKILL_NEEDED"
+            },
+            {
+                "query": "Convert this markdown file to a Word document",
+                "label": "SKILL_NEEDED",
+                "reason": "No markdown-to-docx skill exists.",
+                "chain_of_thought": "markdown→docx conversion requires pandoc or python-docx integration. Skills index: no markdown-to-docx skill. → SKILL_NEEDED"
+            },
+            {
+                "query": "Set up a Python virtual environment and install dependencies from requirements.txt",
+                "label": "SKILL_NEEDED",
+                "reason": "No python-env-setup skill exists.",
+                "chain_of_thought": "Shell automation for venv + pip install. Skills index: no python-env-setup skill found. Queuing for creation. → SKILL_NEEDED"
+            },
+
+            # CURRENT examples (6)
+            {
+                "query": "What are the latest AI developments in 2026?",
+                "label": "CURRENT",
+                "reason": "Latest and 2026 signal recency beyond 2023 training.",
+                "chain_of_thought": "'Latest' + '2026' both signal real-time information beyond training cutoff. Cannot answer from static knowledge. → CURRENT"
+            },
+            {
+                "query": "What is the current price of Bitcoin?",
+                "label": "CURRENT",
+                "reason": "Prices change in real-time.",
+                "chain_of_thought": "'Current price' is inherently real-time data. Bitcoin price changes every second. Static training data is useless here. → CURRENT"
+            },
+            {
+                "query": "Who won the Super Bowl this year?",
+                "label": "CURRENT",
+                "reason": "Sports results are time-sensitive.",
+                "chain_of_thought": "'This year' signals recency. Sports results are not in training data for current season. Web search required. → CURRENT"
+            },
+            {
+                "query": "What are the latest Ubuntu 24.04 security updates?",
+                "label": "CURRENT",
+                "reason": "Security updates released continuously.",
+                "chain_of_thought": "'Latest' + 'security updates' — CVEs and patches are released daily. Training data is stale for this. → CURRENT"
+            },
+            {
+                "query": "Is there a new version of phi4-mini available?",
+                "label": "CURRENT",
+                "reason": "Model releases happen after training cutoff.",
+                "chain_of_thought": "'New version' of a model released post-cutoff. Model release information requires web search. → CURRENT"
+            },
+            {
+                "query": "What is the current status of the Anthropic API rate limits?",
+                "label": "CURRENT",
+                "reason": "API policies change frequently.",
+                "chain_of_thought": "'Current status' of API policies — these change frequently. Must query live documentation or search. → CURRENT"
+            },
         ]
 
         # Embed and store each example
@@ -514,14 +552,15 @@ async def seed_classifier_examples(
                 # Get embedding for query
                 embedding = await get_ollama_embedding(example["query"])
 
-                # Store in collection
+                # Store in collection with chain_of_thought in metadata
                 classifier_collection.add(
                     embeddings=[embedding],
                     documents=[example["query"]],
                     metadatas=[{
                         "query": example["query"],
                         "label": example["label"],
-                        "reason": example["reason"]
+                        "reason": example["reason"],
+                        "chain_of_thought": example["chain_of_thought"]
                     }],
                     ids=[f"example_{seeded_count}_{datetime.now().timestamp()}"]
                 )

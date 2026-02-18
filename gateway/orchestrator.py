@@ -192,7 +192,15 @@ class SkillMatcher:
 
 
 class IntentClassifier:
-    """Classify query intent: ACTION vs KNOWLEDGE with hybrid LLM disambiguation"""
+    """Classify query intent: ACTION | KNOWLEDGE | CURRENT with hybrid LLM disambiguation"""
+
+    # High-confidence CURRENT patterns - temporal / real-time signals
+    # These trigger CURRENT directly without LLM disambiguation.
+    CURRENT_SIGNALS = [
+        "latest", "current", "recent", "today", "this year",
+        "in 2025", "in 2026",
+        "news", "update", "release", "version"
+    ]
 
     # High-confidence KNOWLEDGE patterns - unambiguous questions
     KNOWLEDGE_PATTERNS_HIGH = [
@@ -261,14 +269,19 @@ class IntentClassifier:
     @staticmethod
     def classify_intent(query: str) -> tuple[str, str]:
         """
-        Classify query intent with confidence scoring
+        Classify query intent with confidence scoring.
 
         Returns:
             Tuple of (intent, confidence) where:
-            - intent: "knowledge" or "action"
+            - intent: "knowledge", "action", or "current"
             - confidence: "high" or "ambiguous"
         """
         query_lower = query.lower().strip()
+
+        # Check CURRENT temporal signals first (before KNOWLEDGE/ACTION)
+        for signal in IntentClassifier.CURRENT_SIGNALS:
+            if signal in query_lower:
+                return ("current", "high")
 
         # Check high-confidence KNOWLEDGE patterns first
         for pattern in IntentClassifier.KNOWLEDGE_PATTERNS_HIGH:
@@ -298,21 +311,145 @@ class IntentClassifier:
         return ("knowledge", "high")
 
 
-async def classify_with_ollama(query: str, ollama_url: str, rag_url: str, signed_client: Optional[Any] = None) -> str:
+def parse_classification(text: str) -> str:
     """
-    Fast LLM classification for ambiguous queries using few-shot examples from ChromaDB.
+    Parse LLM classification response into one of four intent labels.
 
-    Uses minimal tokens for quick classification (~3-5s on phi4-mini).
+    Checks SKILL_NEEDED before ACTION to avoid substring match on 'ACTION'.
+
+    Args:
+        text: Raw LLM response text
+
+    Returns:
+        One of: "skill_needed", "action", "current", "knowledge"
+    """
+    upper = text.strip().upper()
+    if "SKILL_NEEDED" in upper:
+        return "skill_needed"
+    if "ACTION" in upper:
+        return "action"
+    if "CURRENT" in upper:
+        return "current"
+    if "KNOWLEDGE" in upper:
+        return "knowledge"
+    return "knowledge"
+
+
+async def classify_with_haiku(prompt: str, vault_url: str, ollama_url: str) -> str:
+    """
+    Classify query using claude-haiku-4-5-20251001 via Anthropic SDK.
+    Falls back to local phi4-mini on failure or missing API key.
+
+    Args:
+        prompt: Full chain-of-thought classification prompt
+        vault_url: Vault service URL to retrieve Anthropic API key
+        ollama_url: Ollama URL used for local fallback
+
+    Returns:
+        One of: "skill_needed", "action", "current", "knowledge"
+    """
+    logger.info("🌐 Using Haiku for classification")
+    try:
+        # Retrieve API key from vault
+        api_key = None
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{vault_url}/secrets/anthropic_api_key")
+            if resp.status_code == 200:
+                api_key = resp.json().get("value") or resp.json().get("anthropic_api_key")
+
+        if not api_key:
+            logger.warning("Anthropic API key not found in vault, falling back to local")
+            return await classify_with_ollama_local(prompt, ollama_url)
+
+        from anthropic import AsyncAnthropic
+        ac = AsyncAnthropic(api_key=api_key)
+
+        message = await ac.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = message.content[0].text if message.content else ""
+        result = parse_classification(raw)
+        logger.info(f"✓ Haiku classified as: {result.upper()}")
+        return result
+
+    except Exception as e:
+        logger.warning(f"Haiku classification failed: {e}, falling back to local")
+        return await classify_with_ollama_local(prompt, ollama_url)
+
+
+async def classify_with_ollama_local(prompt: str, ollama_url: str) -> str:
+    """
+    Classify query using local phi4-mini model via Ollama.
+
+    Args:
+        prompt: Full chain-of-thought classification prompt
+        ollama_url: Ollama service URL
+
+    Returns:
+        One of: "skill_needed", "action", "current", "knowledge"
+    """
+    logger.info("💻 Using phi4-mini for classification")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": "phi4-mini:3.8b",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": 50,
+                        "temperature": 0.1,
+                        "top_p": 0.9
+                    }
+                }
+            )
+            data = response.json()
+            raw = data.get("response", "").strip()
+            result = parse_classification(raw)
+            logger.info(f"✓ phi4-mini classified as: {result.upper()}")
+            return result
+
+    except Exception as e:
+        logger.warning(f"phi4-mini classification failed: {e}, defaulting to knowledge")
+        return "knowledge"
+
+
+async def classify_query(
+    query: str,
+    ollama_url: str,
+    rag_url: str,
+    vault_url: str = "http://vault:8200",
+    signed_client: Optional[Any] = None,
+    skills: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Classify query intent using chain-of-thought few-shot prompting.
+
+    Routes to Haiku (remote) or phi4-mini (local) based on CLASSIFIER_BACKEND env var.
+    Falls back to local if Haiku is unavailable or times out.
 
     Args:
         query: The user query to classify
         ollama_url: Ollama service URL
         rag_url: RAG service URL for fetching examples
+        vault_url: Vault URL for retrieving Anthropic API key
         signed_client: Optional SignedClient for authenticated requests
+        skills: Dict of loaded skills (name → skill dict) for AVAILABLE SKILLS section
 
     Returns:
-        "action" or "knowledge"
+        One of: "skill_needed", "action", "current", "knowledge"
     """
+    backend = os.getenv("CLASSIFIER_BACKEND", "local").strip().lower()
+
+    # Build skills index for prompt
+    skills_index: Dict[str, str] = {}
+    if skills:
+        for name, skill in skills.items():
+            skills_index[name] = skill.get("description", "")
+
     # Fetch similar examples from RAG service
     examples = []
     try:
@@ -333,68 +470,36 @@ async def classify_with_ollama(query: str, ollama_url: str, rag_url: str, signed
             else:
                 logger.warning(f"Failed to fetch examples: HTTP {response.status_code}")
     except Exception as e:
-        logger.warning(f"Failed to fetch few-shot examples: {e}, falling back to zero-shot")
+        logger.warning(f"Failed to fetch few-shot examples: {e}, using zero-shot")
 
-    # Build prompt - few-shot if examples available, zero-shot otherwise
-    if examples:
-        # Build few-shot prompt
-        system_prompt = """You are a query intent classifier.
-ACTION = user wants a specific artifact, script, transformation, or execution
-KNOWLEDGE = user wants explanation, analysis, comparison, or architectural guidance
+    # Build chain-of-thought prompt
+    skills_section = ""
+    if skills_index:
+        skills_lines = "\n".join(f"  - {name}: {desc}" for name, desc in skills_index.items())
+        skills_section = f"\nAVAILABLE SKILLS:\n{skills_lines}\n"
 
+    prompt_header = f"""You are a query intent classifier. Classify the query into exactly one of:
+
+ACTION       - User wants an artifact/script/code that can be produced with AVAILABLE SKILLS
+SKILL_NEEDED - User wants something that requires a new skill not in AVAILABLE SKILLS
+KNOWLEDGE    - User wants explanation, analysis, comparison, or conceptual guidance
+CURRENT      - User needs real-time or post-2024 information (prices, news, latest versions)
+{skills_section}
 Examples:"""
 
-        for ex in examples:
-            system_prompt += f"\nQ: {ex['query']}\nA: {ex['label']}\n"
+    for ex in examples:
+        cot = ex.get("chain_of_thought", "")
+        cot_line = f"\nReasoning: {cot}" if cot else ""
+        prompt_header += f"\nQ: {ex['query']}{cot_line}\nA: {ex['label']}\n"
 
-        system_prompt += "\nReply with only one word: ACTION or KNOWLEDGE"
-        full_prompt = f"{system_prompt}\n\nQ: {query}\nA:"
-        logger.info("Using few-shot classification prompt")
+    full_prompt = f"{prompt_header}\nQ: {query}\nReasoning:"
+
+    logger.info(f"🔍 classify_query — backend={backend}, examples={len(examples)}")
+
+    if backend == "remote":
+        return await classify_with_haiku(full_prompt, vault_url, ollama_url)
     else:
-        # Fallback to zero-shot
-        system_prompt = """You are a query classifier. Classify the query as exactly one of:
-
-ACTION - user wants you to create, build, execute, or produce something specific (code, script, file, output)
-KNOWLEDGE - user wants explanation, analysis, comparison, discussion, or theoretical understanding
-
-Reply with only the single word: ACTION or KNOWLEDGE"""
-        full_prompt = f"{system_prompt}\n\nQuery: {query}\n\nClassification:"
-        logger.info("Using zero-shot classification prompt (no examples available)")
-
-    try:
-        logger.info("🔍 Using LLM for ambiguous query classification")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{ollama_url}/api/generate",
-                json={
-                    "model": "phi4-mini:3.8b",
-                    "prompt": full_prompt,
-                    "stream": False,
-                    "options": {
-                        "num_predict": 5,  # Only need one word
-                        "temperature": 0.1,  # Low temperature for deterministic output
-                        "top_p": 0.9
-                    }
-                }
-            )
-
-            data = response.json()
-            result = data.get("response", "").strip().upper()
-
-            # Parse result - look for ACTION or KNOWLEDGE
-            if "ACTION" in result:
-                logger.info("✓ LLM classified as: ACTION")
-                return "action"
-            elif "KNOWLEDGE" in result:
-                logger.info("✓ LLM classified as: KNOWLEDGE")
-                return "knowledge"
-            else:
-                logger.warning(f"LLM returned unexpected result: {result}, defaulting to KNOWLEDGE")
-                return "knowledge"
-
-    except Exception as e:
-        logger.warning(f"LLM classification failed: {e}, defaulting to KNOWLEDGE")
-        return "knowledge"  # Graceful fallback
+        return await classify_with_ollama_local(full_prompt, ollama_url)
 
 
 class ComplexityClassifier:
@@ -733,16 +838,18 @@ async def route_query(
     memory_service_url: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Main routing logic for intelligent query handling
+    Main routing logic for intelligent query handling.
 
-    This is the entry point called by Gateway
+    This is the entry point called by Gateway.
+
+    Intents (v2): action | knowledge | current | skill_needed
 
     Args:
         query: User query (may be augmented with search results)
         user_id: User identifier
         vault_url: Vault service URL
         ollama_url: Ollama service URL
-        has_search_results: If True, query contains search results and should skip skill matching
+        has_search_results: If True, query contains search results → skip skill logic
     """
 
     # IMPORTANT: If query has search results, skip ALL skill logic and go directly to Ollama
@@ -750,72 +857,70 @@ async def route_query(
         logger.info("Query has search results - skipping skill matching/creation, using Ollama for summarization")
         logger.info(f"Query: '{query[:100]}...'")
 
-        # Get relevant context from RAG (NEW - only relevant chunks)
         orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
         context = await orchestrator.get_relevant_context(query, max_tokens=300)
 
-        # Prepend context if available
-        if context:
-            enhanced_query = f"Context:\n{context}\n\n---\n\n{query}"
-        else:
-            enhanced_query = query
+        enhanced_query = f"Context:\n{context}\n\n---\n\n{query}" if context else query
 
-        # Use Ollama directly to summarize search results
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{ollama_url}/api/generate",
-                json={
-                    "model": "phi4-mini:3.8b",
-                    "prompt": enhanced_query,
-                    "stream": False
-                }
+                json={"model": "phi4-mini:3.8b", "prompt": enhanced_query, "stream": False}
             )
             result = response.json().get("response", "")
 
-        return {
-            "result": result,
-            "method": "direct_ollama",
-            "cost": 0.0,
-            "engine": "ollama"
-        }
+        return {"result": result, "method": "direct_ollama", "cost": 0.0, "engine": "ollama"}
 
-    # Step 1: Classify intent with confidence scoring
+    # ── Step 1: Fast regex classifier ───────────────────────────────────────
     intent, confidence = IntentClassifier.classify_intent(query)
     logger.info(f"Intent classification: {intent} (confidence: {confidence})")
 
-    # Step 1b: Use LLM for ambiguous cases
+    # ── Step 1b: LLM disambiguation for ambiguous cases ─────────────────────
     if confidence == "ambiguous":
-        logger.info(f"⚠️  Ambiguous query detected, invoking LLM classifier")
-        # Create temporary orchestrator to get signed_client
+        logger.info("⚠️  Ambiguous query detected, invoking LLM classifier")
         temp_orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
         rag_url = temp_orchestrator.rag_url
-        intent = await classify_with_ollama(query, ollama_url, rag_url, temp_orchestrator.signed_client)
+
+        # Load skills for context in the prompt
+        matcher_tmp = SkillMatcher()
+        intent = await classify_query(
+            query,
+            ollama_url,
+            rag_url,
+            vault_url=vault_url,
+            signed_client=temp_orchestrator.signed_client,
+            skills=matcher_tmp.skills
+        )
         logger.info(f"LLM resolved intent: {intent}")
 
-    # If KNOWLEDGE intent, bypass all skill logic and go directly to Ollama
+    logger.info(f"Query: '{query[:50]}...'")
+    logger.info(f"Intent: {intent}")
+
+    orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
+
+    # ── CURRENT: real-time web search then Ollama summarize ──────────────────
+    if intent == "current":
+        logger.info("CURRENT intent — triggering web search flow")
+        # The gateway's search flow re-calls route_query with has_search_results=True.
+        # Here we signal the caller to perform a web search.
+        return {
+            "result": "",
+            "method": "web_search_needed",
+            "intent": "current",
+            "cost": 0.0,
+            "engine": "search"
+        }
+
+    # ── KNOWLEDGE: direct Ollama ─────────────────────────────────────────────
     if intent == "knowledge":
-        logger.info("KNOWLEDGE intent detected - bypassing skill matching, using Ollama directly")
-        logger.info(f"Query: '{query[:100]}...'")
-
-        # Get relevant context from RAG (NEW - only relevant chunks)
-        orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
+        logger.info("KNOWLEDGE intent - using Ollama directly")
         context = await orchestrator.get_relevant_context(query, max_tokens=300)
+        enhanced_query = f"Context:\n{context}\n\n---\n\nUser query: {query}" if context else query
 
-        # Prepend context if available
-        if context:
-            enhanced_query = f"Context:\n{context}\n\n---\n\nUser query: {query}"
-        else:
-            enhanced_query = query
-
-        # Use Ollama directly for knowledge queries
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{ollama_url}/api/generate",
-                json={
-                    "model": "phi4-mini:3.8b",
-                    "prompt": enhanced_query,
-                    "stream": False
-                }
+                json={"model": "phi4-mini:3.8b", "prompt": enhanced_query, "stream": False}
             )
             result = response.json().get("response", "")
 
@@ -827,107 +932,133 @@ async def route_query(
             "engine": "ollama"
         }
 
-    # Step 2: Check for matching skill (only for ACTION intent)
+    # ── SKILL_NEEDED: queue skill creation ───────────────────────────────────
+    if intent == "skill_needed":
+        logger.info(f"SKILL_NEEDED intent — queuing skill creation for: {query[:80]}")
+        await queue_skill_creation(query)
+        return {
+            "result": (
+                "I don't have a skill for this yet, but I've queued it for creation. "
+                "A new skill will be built and available soon. "
+                f"Task queued: \"{query[:100]}\""
+            ),
+            "method": "skill_queued",
+            "intent": "skill_needed",
+            "cost": 0.0,
+            "engine": "none"
+        }
+
+    # ── ACTION: match existing skill or fall through to complexity routing ────
+    # intent == "action"
     matcher = SkillMatcher()
     matching_skill = matcher.find_matching_skill(query, exclude_categories=['search'])
 
-    # Step 3: Classify complexity (for ACTION queries)
     complexity = ComplexityClassifier.classify(query, bool(matching_skill))
 
-    logger.info(f"Query: '{query[:50]}...'")
     logger.info(f"Has search results: {has_search_results}")
-    logger.info(f"Intent: {intent}")
     logger.info(f"Classification: {complexity}")
     if matching_skill:
         logger.info(f"Matched skill: {matching_skill['name']}")
 
-    # Step 4: Route based on classification
-    orchestrator = ClaudeCodeOrchestrator(vault_url, memory_service_url)
-    
     if complexity == "skill_execution":
-        # Execute with existing skill
-        result = await orchestrator.execute_skill(
-            matching_skill,
-            query,
-            query,  # Full query as arguments
-            ollama_url
-        )
-        
+        result = await orchestrator.execute_skill(matching_skill, query, query, ollama_url)
         return {
             "result": result,
             "method": "skill_execution",
+            "intent": "action",
             "skill_used": matching_skill['name'],
             "cost": 0.0,
             "engine": "ollama"
         }
-    
+
     elif complexity == "skill_creation":
-        # Create new skill, then execute
         logger.info("Creating new skill (this costs $$)")
-        
-        # Create skill with Claude API
         skill = await orchestrator.create_skill(query, purpose=query)
-        
-        # Execute with Ollama
-        result = await orchestrator.execute_skill(
-            skill,
-            query,
-            query,
-            ollama_url
-        )
-        
+        result = await orchestrator.execute_skill(skill, query, query, ollama_url)
         return {
             "result": result,
             "method": "skill_creation",
+            "intent": "action",
             "skill_created": skill['name'],
             "skill_path": str(skill['path']),
-            "cost": 0.10,  # Skill creation cost
+            "cost": 0.10,
             "engine": "claude+ollama"
         }
-    
+
     elif complexity == "direct_claude":
-        # Complex one-off, use Claude directly
         logger.info("Using Claude API directly for complex query")
-        
         result = await orchestrator._call_claude_api(query)
-        
         return {
             "result": result,
             "method": "direct_claude",
+            "intent": "action",
             "cost": 0.006,
             "engine": "claude"
         }
-    
+
     else:  # direct_ollama
-        # Simple query, Ollama direct
-        logger.info("Using Ollama directly for simple query")
-
-        # Get relevant context from RAG (NEW - only relevant chunks)
+        logger.info("Using Ollama directly for simple action query")
         context = await orchestrator.get_relevant_context(query, max_tokens=300)
-
-        # Prepend context if available
-        if context:
-            enhanced_query = f"Context:\n{context}\n\n---\n\nUser query: {query}"
-        else:
-            enhanced_query = query
+        enhanced_query = f"Context:\n{context}\n\n---\n\nUser query: {query}" if context else query
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{ollama_url}/api/generate",
-                json={
-                    "model": "phi4-mini:3.8b",
-                    "prompt": enhanced_query,
-                    "stream": False
-                }
+                json={"model": "phi4-mini:3.8b", "prompt": enhanced_query, "stream": False}
             )
             result = response.json().get("response", "")
 
         return {
             "result": result,
             "method": "direct_ollama",
+            "intent": "action",
             "cost": 0.0,
             "engine": "ollama"
         }
+
+
+async def queue_skill_creation(query: str) -> None:
+    """
+    Queue a skill creation request by appending a task to tasks.json.
+
+    The tasks.json file is stored at MEMORY_DIR/tasks.json (mounted volume).
+    MEMORY_DIR defaults to /memory if the env var is not set.
+
+    Args:
+        query: The user query that triggered the skill creation request
+    """
+    memory_dir = Path(os.getenv("MEMORY_DIR", "/memory"))
+    tasks_path = memory_dir / "tasks.json"
+
+    # Load existing tasks or start fresh
+    tasks = []
+    if tasks_path.exists():
+        try:
+            tasks = json.loads(tasks_path.read_text(encoding="utf-8"))
+            if not isinstance(tasks, list):
+                tasks = []
+        except Exception as e:
+            logger.warning(f"Could not read tasks.json: {e}, starting fresh")
+            tasks = []
+
+    # Build new task entry
+    now = datetime.now()
+    task = {
+        "id": f"task_{int(now.timestamp())}",
+        "type": "skill_creation",
+        "query": query,
+        "status": "pending",
+        "created": now.isoformat()
+    }
+    tasks.append(task)
+
+    # Write back to tasks.json
+    try:
+        tasks_path.parent.mkdir(parents=True, exist_ok=True)
+        tasks_path.write_text(json.dumps(tasks, indent=2), encoding="utf-8")
+        logger.info(f"📋 Skill creation queued for: {query[:50]}")
+    except Exception as e:
+        logger.error(f"Failed to write tasks.json: {e}")
 
 
 async def seed_classifier_examples_on_startup(rag_url: str, signed_client: Optional[Any] = None):
