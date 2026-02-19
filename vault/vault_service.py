@@ -315,8 +315,7 @@ class SearchOrchestrator:
             logger.info(f"Tavily Search provider initialized (priority: {self.providers[-1]['priority']})")
 
         # Initialize Brave Search if configured AND enabled
-        if (config.get("brave_api_key") and
-            self.user_config.is_skill_enabled("search-brave")):
+        if config.get("brave_api_key"):
 
             self.providers.append({
                 "provider": BraveSearch(config["brave_api_key"]),
