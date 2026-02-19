@@ -231,13 +231,6 @@ def rag_get_history_context(query: str, max_tokens: int = 120) -> Optional[str]:
     return rag_get_context(query, max_tokens=max_tokens, collection="cli_history")
 
 
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def rag_store_exchange(user_msg: str, bot_msg: str, meta: dict):
     try:
         http_post(f"{RAG_URL}/embed/conversation",
@@ -299,6 +292,68 @@ class SystemPromptBuilder:
                 hist_ctx = rag_get_history_context(user_query, max_tokens=120) or ""
             except Exception:
                 self._rag_ok = False
+        # ── IDENTITY (soul.md) ──
+        soul_path = os.path.join(MEMORY_DIR, "soul.md")
+        soul_content = read_file_safe(soul_path)
+        if soul_content:
+            parts.append(self._first_paragraph(soul_content))
+        else:
+            import logging
+            logging.warning("soul.md missing or empty — skipping IDENTITY section")
+
+        # ── USER PROFILE (user.md) ──
+        user_path = os.path.join(MEMORY_DIR, "user.md")
+        user_content = read_file_safe(user_path)
+        if user_content and not user_query:
+            parts.append(f"USER PROFILE:\n{user_content}")
+        else:
+            import logging
+            logging.warning("user.md missing or empty — skipping USER PROFILE section")
+
+        # ── CURRENT SESSION (session.md) ──
+        session_path = os.path.join(MEMORY_DIR, "session.md")
+        session_content = read_file_safe(session_path)
+        if session_content and not user_query:
+            parts.append(f"CURRENT SESSION:\n{session_content}")
+        else:
+            import logging
+            logging.warning("session.md missing or empty — skipping SESSION section")
+
+        # ── RELEVANT CONTEXT (RAG) ──
+        rag_ctx = ""
+        if user_query and self._rag_ok:
+            try:
+                rag_ctx = rag_get_context(user_query, max_tokens=200) or ""
+                if rag_ctx:
+                    parts.append(f"RELEVANT MEMORY CONTEXT:\n{rag_ctx}")
+                hist_ctx = rag_get_history_context(user_query, max_tokens=120) or ""
+                if hist_ctx:
+                    parts.append(f"RELEVANT PAST CONTEXT:\n{hist_ctx}")
+            except Exception:
+                self._rag_ok = False
+                import logging
+                logging.warning("RAG context fetch failed — skipping RELEVANT CONTEXT section")
+
+        if user_query and not rag_ctx:
+            if user_content:
+                parts.append(f"USER PROFILE:\n{user_content}")
+            if session_content:
+                parts.append(f"CURRENT SESSION:\n{session_content}")
+
+        # ── AVAILABLE SKILLS (all skills) ──
+        relevant_skills = []
+        if user_query and self._rag_ok:
+            for item in rag_get_skills(user_query, k=3):
+                sim = item.get("similarity", item.get("score", 0))
+                if sim is None or sim < 0.5:
+                    continue
+                relevant_skills.append((item.get("name", "unknown"), item.get("description", ""), sim))
+        if relevant_skills:
+            parts.append("RELEVANT SKILLS FOR THIS QUERY:")
+            for n, d, sim in relevant_skills:
+                parts.append(f"- {n}: {d} (similarity: {sim:.2f})")
+        else:
+            parts.append("RELEVANT SKILLS FOR THIS QUERY:\nNo existing skills match this query. A new skill can be created.")
 
         if rag_ctx:
             parts.append(f"RELEVANT MEMORY CONTEXT:\n{rag_ctx}")
@@ -343,11 +398,16 @@ class SystemPromptBuilder:
         if todo:
             task_lines.append("Pending:")
             for t in todo[:3]:
-                title = t.get("title", "")
+                title    = t.get("title", "")
+                priority = t.get("priority", "medium")
                 if title:
                     task_lines.append(f"- {title}")
         if task_lines:
             parts.append("CURRENT TASKS:\n" + "\n".join(task_lines))
+
+        # ── RESPONSE STYLE ──
+        parts.append(f"TONE: {tone_desc}")
+        parts.append(f"VERBOSITY: {verb_desc}")
 
         # 7) style controls
         parts.append(f"TONE: {tone_desc}")
