@@ -7,6 +7,7 @@ Single-file, SSH-compatible, curses-based
 import curses
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -966,6 +967,37 @@ class SecureBotCLI:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _open_editor(self, path: str, editor: str, fname: str):
+        """Suspend curses, run $EDITOR, then restore terminal state safely."""
+        try:
+            curses.def_prog_mode()
+            curses.endwin()
+            print("Opening editor... (save and exit to return to SecureBot CLI)")
+            cmd = shlex.split(editor) if editor else ["nano"]
+            subprocess.call(cmd + [path])
+        except Exception as exc:
+            self.chat.add(f"Editor error: {exc}", C_RED)
+        finally:
+            try:
+                curses.reset_prog_mode()
+                self.stdscr.keypad(True)
+                curses.cbreak()
+                curses.noecho()
+                self.stdscr.nodelay(True)
+                curses.flushinp()
+                self.stdscr.clear()
+                self.stdscr.refresh()
+            except Exception:
+                pass
+
+        # Rebuild system prompt so edits take effect immediately
+        try:
+            self.sp_builder.build()
+            self.chat.add(f"{fname} saved. System prompt reloaded.", C_GREEN)
+        except Exception as exc:
+            self.chat.add(f"Prompt rebuild error: {exc}", C_YELLOW)
+        self._redraw_needed.set()
+
     # ── SLASH COMMANDS ────────────────
     def _slash(self, raw: str):
         """Handle /command [args].  raw includes the leading slash."""
@@ -1075,34 +1107,7 @@ class SecureBotCLI:
             fname = f"{arg}.md"
             fpath = os.path.join(MEMORY_DIR, fname)
             editor = os.environ.get("EDITOR", "nano")
-            def _do(path=fpath, ed=editor, fn=fname):
-                try:
-                    curses.endwin()
-                    print("Opening editor... (press Ctrl+X to save and exit)")
-                    subprocess.call([ed, path])
-                    self.stdscr.keypad(True)
-                    curses.cbreak()
-                    curses.noecho()
-                    self.stdscr.clear()
-                    self.stdscr.refresh()
-                except Exception as exc:
-                    try:
-                        self.stdscr.keypad(True)
-                        curses.cbreak()
-                        curses.noecho()
-                        self.stdscr.clear()
-                        self.stdscr.refresh()
-                    except Exception:
-                        pass
-                    self.chat.add(f"Editor error: {exc}", C_RED)
-                # Rebuild system prompt so edits take effect immediately
-                try:
-                    self.sp_builder.build()
-                    self.chat.add(f"{fn} saved. System prompt reloaded.", C_GREEN)
-                except Exception as exc:
-                    self.chat.add(f"Prompt rebuild error: {exc}", C_YELLOW)
-                self._redraw_needed.set()
-            threading.Thread(target=_do, daemon=True).start()
+            self._open_editor(fpath, editor, fname)
             return
 
         if verb == "/reload":
