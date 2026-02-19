@@ -227,6 +227,17 @@ def rag_get_skills(query: str, k: int = 2) -> list:
     return []
 
 
+def rag_get_history_context(query: str, max_tokens: int = 120) -> Optional[str]:
+    return rag_get_context(query, max_tokens=max_tokens, collection="cli_history")
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def rag_store_exchange(user_msg: str, bot_msg: str, meta: dict):
     try:
         http_post(f"{RAG_URL}/embed/conversation",
@@ -256,6 +267,10 @@ class SystemPromptBuilder:
         """Estimate token count as word count * 1.3."""
         return int(len(text.split()) * 1.3)
 
+    def _first_paragraph(self, text: str) -> str:
+        parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+        return parts[0] if parts else ""
+
     def build(self, user_query: str = "") -> str:
         tasks = read_tasks()
 
@@ -264,96 +279,81 @@ class SystemPromptBuilder:
         tone_desc = TONE_DESCRIPTIONS.get(tone_val, TONE_DESCRIPTIONS[2])[1]
         verb_desc = VERBOSITY_DESCRIPTIONS.get(verb_val, VERBOSITY_DESCRIPTIONS[3])[1]
 
-        parts = [
-            "Answer only what is asked. Do not invent session IDs, timestamps, "
-            "privacy policies, or procedures not mentioned in the context. "
-            "Be direct and natural."
-            "You are SecureBot, a personal AI assistant helping Roland with IT "
-            "automation, AI engineering, and system administration. Use the context "
-            "below to give personalized, relevant answers."
-        ]
+        parts = []
 
-        # ── IDENTITY (soul.md) ──
-        soul_path = os.path.join(MEMORY_DIR, "soul.md")
-        soul_content = read_file_safe(soul_path)
+        # 1) identity
+        soul_content = read_file_safe(os.path.join(MEMORY_DIR, "soul.md"))
         if soul_content:
-            parts.append(f"--- IDENTITY ---\n{soul_content}\n--- END IDENTITY ---")
-        else:
-            import logging
-            logging.warning("soul.md missing or empty — skipping IDENTITY section")
+            parts.append(self._first_paragraph(soul_content))
 
-        # ── USER PROFILE (user.md) ──
-        user_path = os.path.join(MEMORY_DIR, "user.md")
-        user_content = read_file_safe(user_path)
-        if user_content:
-            parts.append(f"--- USER PROFILE ---\n{user_content}\n--- END USER PROFILE ---")
-        else:
-            import logging
-            logging.warning("user.md missing or empty — skipping USER PROFILE section")
+        # 2/3) user + session (full on fallback or empty query)
+        user_content = read_file_safe(os.path.join(MEMORY_DIR, "user.md"))
+        session_content = read_file_safe(os.path.join(MEMORY_DIR, "session.md"))
 
-        # ── CURRENT SESSION (session.md) ──
-        session_path = os.path.join(MEMORY_DIR, "session.md")
-        session_content = read_file_safe(session_path)
-        if session_content:
-            parts.append(f"--- CURRENT SESSION ---\n{session_content}\n--- END SESSION ---")
-        else:
-            import logging
-            logging.warning("session.md missing or empty — skipping SESSION section")
-
-        # ── RELEVANT CONTEXT (RAG) ──
+        # 4) relevant memory from RAG + conversation context
+        rag_ctx = ""
+        hist_ctx = ""
         if user_query and self._rag_ok:
             try:
-                rag_ctx = rag_get_context(user_query, max_tokens=300) or ""
-                if rag_ctx:
-                    parts.append(f"--- RELEVANT CONTEXT ---\n{rag_ctx}\n--- END CONTEXT ---")
+                rag_ctx = rag_get_context(user_query, max_tokens=200) or ""
+                hist_ctx = rag_get_history_context(user_query, max_tokens=120) or ""
             except Exception:
                 self._rag_ok = False
-                import logging
-                logging.warning("RAG context fetch failed — skipping RELEVANT CONTEXT section")
 
-        # ── AVAILABLE SKILLS (all skills) ──
-        skills = self._skills if self._skills else fetch_skills()
-        if skills:
-            skill_lines = [f"{s.get('name', '')}: {s.get('description', '')}"
-                           for s in skills if s.get("name")]
-            skills_block = "\n".join(skill_lines)
-            parts.append(
-                "--- AVAILABLE SKILLS ---\n"
-                "You have these skills. Use them when relevant. If no skill matches a "
-                "request, say so clearly - do not pretend to execute skills you lack.\n"
-                f"{skills_block}\n"
-                "--- END SKILLS ---"
-            )
+        if rag_ctx:
+            parts.append(f"RELEVANT MEMORY CONTEXT:\n{rag_ctx}")
+        if hist_ctx:
+            parts.append(f"RELEVANT PAST CONTEXT:\n{hist_ctx}")
 
-        # ── TASKS ──
+        # fallback to file injection if no semantic context available
+        if not user_query or (user_query and not rag_ctx):
+            if user_content:
+                parts.append(f"USER PROFILE:\n{user_content}")
+            if session_content:
+                parts.append(f"CURRENT SESSION:\n{session_content}")
+
+        # 5) skills relevant to query (semantic)
+        relevant_skills = []
+        if user_query and self._rag_ok:
+            try:
+                raw_skills = rag_get_skills(user_query, k=3)
+            except Exception:
+                raw_skills = []
+            for item in raw_skills:
+                if not isinstance(item, dict):
+                    continue
+                sim = _safe_float(item.get("similarity", item.get("score", 0.0)), 0.0)
+                if sim < 0.5:
+                    continue
+                relevant_skills.append((item.get("name", "unknown"), item.get("description", ""), sim))
+
+        if relevant_skills:
+            parts.append("RELEVANT SKILLS FOR THIS QUERY:")
+            for n, d, sim in relevant_skills:
+                parts.append(f"- {n}: {d} (similarity: {sim:.2f})")
+        else:
+            parts.append("RELEVANT SKILLS FOR THIS QUERY:\nNo existing skills match this query. A new skill can be created.")
+
+        # 6) tasks (compact)
         active = tasks.get("active_task")
-        todo   = tasks.get("todo", [])
+        todo = tasks.get("todo", [])
         task_lines = []
         if active:
-            task_lines.append(
-                f"Active: {active.get('title', '')} ({active.get('status', '')})"
-            )
+            task_lines.append(f"Active: {active.get('title', '')} - {active.get('status', '')}")
         if todo:
             task_lines.append("Pending:")
-            for t in todo:
-                title    = t.get("title", "")
-                priority = t.get("priority", "medium")
+            for t in todo[:3]:
+                title = t.get("title", "")
                 if title:
-                    task_lines.append(f"- {title} ({priority})")
+                    task_lines.append(f"- {title}")
         if task_lines:
-            parts.append(
-                "--- TASKS ---\n" + "\n".join(task_lines) + "\n--- END TASKS ---"
-            )
+            parts.append("CURRENT TASKS:\n" + "\n".join(task_lines))
 
-        # ── RESPONSE STYLE ──
-        parts.append(
-            f"--- RESPONSE STYLE ---\n{tone_desc}\n{verb_desc}\n--- END STYLE ---"
-        )
+        # 7) style controls
+        parts.append(f"TONE: {tone_desc}")
+        parts.append(f"VERBOSITY: {verb_desc}")
 
-        prompt = "\n\n".join(parts)
-
-        import logging
-        logging.debug("System prompt ~%d tokens", self.get_token_estimate(prompt))
+        prompt = "\n\n".join([x for x in parts if x]).strip()
 
         with self._lock:
             self._cached = prompt
