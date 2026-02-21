@@ -8,6 +8,7 @@ License: MIT
 """
 
 import os
+import re
 import sys
 import json
 import subprocess
@@ -17,6 +18,11 @@ from typing import Optional, Dict, Any, List
 import httpx
 import yaml
 from datetime import datetime
+
+# Skill name must start/end with alphanumeric, allow interior hyphens/underscores.
+# Min 3 chars, max 50 chars.
+_SKILL_NAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{1,48}[a-zA-Z0-9]$')
+_MAX_SKILL_CONTENT = 50_000  # characters
 
 RESPONSE_MODEL = os.getenv('RESPONSE_MODEL', 'llama3:8b')
 CLASSIFIER_MODEL = os.getenv('CLASSIFIER_MODEL', 'phi4-mini:3.8b')
@@ -668,6 +674,13 @@ Generate the complete SKILL.md now:
         
         # Parse the generated skill
         try:
+            # Reject oversized content before doing anything else
+            if len(skill_content) > _MAX_SKILL_CONTENT:
+                logger.warning(
+                    f"Skill creation rejected: content too large ({len(skill_content)} chars, max {_MAX_SKILL_CONTENT})"
+                )
+                raise ValueError(f"Skill content exceeds maximum size ({_MAX_SKILL_CONTENT} chars)")
+
             # Extract name from frontmatter
             if '---' in skill_content:
                 parts = skill_content.split('---', 2)
@@ -678,11 +691,36 @@ Generate the complete SKILL.md now:
                     skill_name = 'unnamed-skill'
             else:
                 skill_name = 'unnamed-skill'
-            
+
+            # ── Path traversal / RCE prevention ─────────────────────────────
+            # Reject names containing dangerous characters before regex check
+            dangerous = ('/', '\\', '..', ' ')
+            for bad in dangerous:
+                if bad in skill_name:
+                    logger.warning(
+                        f"Skill creation rejected: name contains forbidden sequence '{bad}': {skill_name!r}"
+                    )
+                    raise ValueError(f"Invalid skill name (forbidden character): {skill_name!r}")
+
+            if not _SKILL_NAME_RE.match(skill_name):
+                logger.warning(
+                    f"Skill creation rejected: name fails validation pattern: {skill_name!r}"
+                )
+                raise ValueError(f"Invalid skill name (pattern mismatch): {skill_name!r}")
+
+            # Resolve destination and assert it stays inside SKILLS_DIR
+            resolved = (self.skills_dir / skill_name).resolve()
+            if not str(resolved).startswith(str(self.skills_dir.resolve())):
+                logger.warning(
+                    f"Skill creation rejected: path traversal attempt — resolved to {resolved}"
+                )
+                raise ValueError(f"Path traversal attempt detected for skill name: {skill_name!r}")
+            # ── End path traversal prevention ────────────────────────────────
+
             # Create skill directory
             skill_dir = self.skills_dir / skill_name
             skill_dir.mkdir(exist_ok=True)
-            
+
             # Save SKILL.md
             skill_file = skill_dir / "SKILL.md"
             skill_file.write_text(skill_content)
@@ -762,12 +800,27 @@ Generate the complete SKILL.md now:
         # Build prompt from skill content with arguments
         skill_content = skill['content']
 
+        # ── Prompt injection prevention ──────────────────────────────────────
+        # Strip common injection delimiter sequences from user-supplied arguments
+        _INJECTION_DELIMITERS = ['---', '<s>', '[INST]', '<<SYS>>', '</s>', '[/INST]']
+        for delim in _INJECTION_DELIMITERS:
+            arguments = arguments.replace(delim, '')
+
+        # Truncate to prevent context overflow
+        if len(arguments) > 2000:
+            logger.warning(f"Arguments truncated from {len(arguments)} to 2000 chars for skill {skill['name']}")
+            arguments = arguments[:2000]
+
+        # Bracket arguments to prevent boundary escape
+        safe_arguments = f"[USER INPUT START]\n{arguments}\n[USER INPUT END]"
+        # ── End prompt injection prevention ─────────────────────────────────
+
         # Replace $ARGUMENTS placeholder
         if '$ARGUMENTS' in skill_content:
-            skill_content = skill_content.replace('$ARGUMENTS', arguments)
+            skill_content = skill_content.replace('$ARGUMENTS', safe_arguments)
         else:
             # Append arguments if not in template
-            skill_content = f"{skill_content}\n\nARGUMENTS: {arguments}"
+            skill_content = f"{skill_content}\n\nARGUMENTS:\n{safe_arguments}"
 
         # Replace session ID if present
         if '${CLAUDE_SESSION_ID}' in skill_content:

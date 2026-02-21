@@ -61,6 +61,7 @@ class ConversationTurn(BaseModel):
     user: str
     assistant: str
     timestamp: str
+    user_id: Optional[str] = None  # for tenant isolation in conversations collection
 
 
 # Helper functions
@@ -232,11 +233,14 @@ async def embed_conversation(
         # Get embedding
         embedding = await get_ollama_embedding(combined)
 
-        # Store in ChromaDB
+        # Store in ChromaDB — include user_id for tenant isolation
+        conv_metadata = {"timestamp": turn.timestamp}
+        if turn.user_id:
+            conv_metadata["user_id"] = turn.user_id
         conversation_collection.add(
             embeddings=[embedding],
             documents=[combined],
-            metadatas=[{"timestamp": turn.timestamp}],
+            metadatas=[conv_metadata],
             ids=[f"conv_{turn.timestamp}_{datetime.now().timestamp()}"]
         )
 
@@ -258,29 +262,48 @@ async def embed_conversation(
 async def get_context(
     query: str,
     max_tokens: int = 300,
+    user_id: Optional[str] = None,
     request: Request = None,
     _auth = Depends(auth_required)
 ):
     """
-    Get relevant context for a query
-    Searches memory (top 2) and conversations (top 1)
+    Get relevant context for a query.
+    Searches memory (top 2, shared) and conversations (top 1, filtered by user_id).
     Requires HMAC authentication.
     """
     try:
         # Get query embedding
         query_embedding = await get_ollama_embedding(query)
 
-        # Search memory collection (top 2 results)
+        # Search memory collection (top 2 results) - shared, no user filter
         memory_results = memory_collection.query(
             query_embeddings=[query_embedding],
             n_results=max(1, min(2, memory_collection.count()))
         )
 
 
-
-
-
+        # Search conversations - filter by user_id for tenant isolation
         conversation_results = None
+        conv_count = conversation_collection.count()
+        if conv_count > 0:
+            try:
+                query_kwargs = dict(
+                    query_embeddings=[query_embedding],
+                    n_results=max(1, min(1, conv_count))
+                )
+                if user_id:
+                    query_kwargs["where"] = {"user_id": user_id}
+                conversation_results = conversation_collection.query(**query_kwargs)
+            except Exception as e:
+                # Graceful fallback if where-filter fails (older docs without user_id)
+                print(f"Conversation filter error (falling back to unfiltered): {e}")
+                try:
+                    conversation_results = conversation_collection.query(
+                        query_embeddings=[query_embedding],
+                        n_results=max(1, min(1, conv_count))
+                    )
+                except Exception:
+                    conversation_results = None
 
         # Build context string
         context_parts = []

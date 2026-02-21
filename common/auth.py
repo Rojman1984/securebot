@@ -25,8 +25,29 @@ logger = logging.getLogger(__name__)
 SERVICE_SECRET = os.getenv("SERVICE_SECRET", "")
 SERVICE_ID = os.getenv("SERVICE_ID", "")
 TIMESTAMP_WINDOW = 30  # seconds
-NONCE_CACHE = {}  # {nonce: timestamp}
+
+# NONCE_CACHE is an in-process dict keyed by nonce → arrival timestamp.
+#
+# ⚠️  MULTI-WORKER LIMITATION: This cache is NOT shared between Uvicorn worker
+# processes. If WEB_CONCURRENCY > 1, two concurrent requests carrying the same
+# nonce can each land on a different worker and both pass validation, defeating
+# replay protection.
+#
+# MITIGATION (current): All services are configured with --workers 1 in
+# docker-compose.yml so only one worker process runs per service.
+#
+# PRODUCTION FIX: Replace with a Redis SET with TTL to share nonce state across
+# any number of workers (e.g. redis.set(nonce, 1, ex=NONCE_EXPIRY, nx=True)).
+NONCE_CACHE: dict = {}  # {nonce: timestamp}
 NONCE_EXPIRY = 60  # seconds
+
+# Warn at import time if multi-worker mode is detected
+_web_concurrency = os.getenv("WEB_CONCURRENCY")
+if _web_concurrency is None or int(_web_concurrency) > 1:
+    logging.getLogger(__name__).warning(
+        "WARNING: Nonce replay protection unreliable with multiple workers. "
+        "Set WEB_CONCURRENCY=1."
+    )
 
 
 def sign_request(method: str, path: str, service_id: str = None, secret: str = None) -> dict:

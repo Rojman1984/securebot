@@ -56,6 +56,23 @@ def _load_service_secret() -> str:
 SERVICE_SECRET = _load_service_secret()
 SERVICE_ID     = "gateway"  # CLI signs as gateway service
 
+
+def _load_gateway_api_key() -> str:
+    """Read GATEWAY_API_KEY from ~/securebot/.env"""
+    env_path = os.path.expanduser("~/securebot/.env")
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("GATEWAY_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return os.getenv("GATEWAY_API_KEY", "")
+
+
+GATEWAY_API_KEY = _load_gateway_api_key()
+
 def _sign_headers(method: str, path: str) -> dict:
     """Generate HMAC auth headers matching common/auth.py sign_request()"""
     if not SERVICE_SECRET:
@@ -438,7 +455,7 @@ class SecureBotApp:
         curses.init_pair(C_HEADER,  curses.COLOR_WHITE,  curses.COLOR_BLUE)
         curses.init_pair(C_USER,    curses.COLOR_WHITE,  -1)
         curses.init_pair(C_BOT,     curses.COLOR_CYAN,   -1)
-        curses.init_pair(C_DIM,     curses.COLOR_BLACK,  -1)
+        curses.init_pair(C_DIM,     curses.COLOR_WHITE,  -1)
         curses.init_pair(C_GREEN,   curses.COLOR_GREEN,  -1)
         curses.init_pair(C_YELLOW,  curses.COLOR_YELLOW, -1)
         curses.init_pair(C_RED,     curses.COLOR_RED,    -1)
@@ -756,10 +773,11 @@ class SecureBotApp:
     def _cmd_status(self):
         def _do():
             checks = [
-                ("Gateway",  f"{GATEWAY_URL}/health",      False),
-                ("Vault",    f"{VAULT_URL}/v1/sys/health", False),
-                ("RAG",      f"{RAG_URL}/health",          True),
-                ("Ollama",   "http://localhost:11434/api/tags", False),
+                ("Gateway",  f"{GATEWAY_URL}/health",           False),
+                ("Vault",    f"{VAULT_URL}/health",             False),
+                ("Memory",   "http://localhost:8300/health",    False),
+                ("RAG",      f"{RAG_URL}/health",               True),
+                ("Ollama",   "http://localhost:11434/api/tags",  False),
             ]
             self.chat.add("── Status ──", curses.color_pair(C_YELLOW))
             for name, url, signed in checks:
@@ -906,10 +924,13 @@ class SecureBotApp:
                     "system":      system_prompt,
                     "temperature": 0.7,
                 }).encode()
+                gw_headers = {"Content-Type": "application/json"}
+                if GATEWAY_API_KEY:
+                    gw_headers["X-API-Key"] = GATEWAY_API_KEY
                 req = urllib.request.Request(
                     f"{GATEWAY_URL}/message",
                     data=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers=gw_headers,
                     method="POST",
                 )
                 t0 = time.time()

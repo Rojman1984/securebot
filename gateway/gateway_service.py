@@ -7,8 +7,10 @@ Author: SecureBot Project
 License: MIT
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+import hmac
 import httpx
 import os
 import sys
@@ -34,6 +36,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Gateway Service", version="2.0.0")
+
+# ── Gateway API Key Middleware ────────────────────────────────────────────────
+# Protects all non-/health endpoints from unauthenticated public access.
+# Set GATEWAY_API_KEY in .env and send as X-API-Key header on every request.
+_GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    """Reject requests missing a valid X-API-Key (except /health)."""
+    if request.url.path == "/health":
+        return await call_next(request)
+    if not _GATEWAY_API_KEY:
+        logger.warning("GATEWAY_API_KEY not set — gateway is unprotected")
+        return await call_next(request)
+    provided = request.headers.get("X-API-Key", "")
+    if not hmac.compare_digest(provided, _GATEWAY_API_KEY):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 
 class Message(BaseModel):
@@ -149,7 +170,7 @@ class GatewayService:
         logger.info(f"Loaded {len(self.skill_matcher.skills)} total skills")
         logger.info(f"Search providers available: {self.search_detector.get_available_providers()}")
 
-    async def _store_conversation(self, user_msg: str, bot_response: str):
+    async def _store_conversation(self, user_msg: str, bot_response: str, user_id: Optional[str] = None):
         """Store conversation turn in RAG service for future context retrieval"""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -157,7 +178,8 @@ class GatewayService:
                 payload = {
                     "user": user_msg[:500],  # Truncate long messages
                     "assistant": bot_response[:500],
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
+                    "user_id": user_id  # for tenant isolation
                 }
 
                 if self.signed_client:
@@ -180,9 +202,12 @@ class GatewayService:
         4. Return formatted response
         """
         start_time = datetime.now()
-        
+
         try:
-            # Step 1: Check if we need web search
+            # Save original query before any augmentation
+            original_query = message.text
+
+            # Step 1: Check if we need web search (keyword-based pre-check)
             needs_search = self.search_detector.needs_search(message.text)
             search_results = None
             has_search_results = False
@@ -207,13 +232,41 @@ class GatewayService:
                 has_search_results=has_search_results,
                 system_prompt=message.system
             )
-            
+
+            # Step 2b: If orchestrator detected a current-info query the keyword
+            # pre-check missed, execute search now and re-route.
+            if orchestrator_result.get("method") == "web_search_needed" and not has_search_results:
+                logger.info("Orchestrator flagged current-info query — executing web search now")
+                search_results = await self._execute_search(original_query)
+                if search_results:
+                    augmented = self._build_search_context(original_query, search_results)
+                    has_search_results = True
+                    orchestrator_result = await route_query(
+                        query=augmented,
+                        user_id=message.user_id,
+                        vault_url=self.vault_url,
+                        ollama_url=self.ollama_url,
+                        has_search_results=True,
+                        system_prompt=message.system
+                    )
+                else:
+                    # Search unavailable — fall back to Ollama with no results
+                    logger.warning("Search execution failed for web_search_needed query — falling back to Ollama")
+                    orchestrator_result = await route_query(
+                        query=original_query,
+                        user_id=message.user_id,
+                        vault_url=self.vault_url,
+                        ollama_url=self.ollama_url,
+                        has_search_results=False,
+                        system_prompt=message.system
+                    )
+
             # Calculate processing time
             elapsed = (datetime.now() - start_time).total_seconds()
 
             # Store conversation in RAG (non-blocking, best-effort)
             bot_response = orchestrator_result["result"]
-            await self._store_conversation(message.text, bot_response)
+            await self._store_conversation(message.text, bot_response, user_id=message.user_id)
 
             # Step 3: Build response
             return {
