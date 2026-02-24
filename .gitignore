@@ -67,3 +67,4 @@ chroma/
 # Keep these (safe to commit)
 !memory/templates/
 !memory/README.md
+.claude-work/
