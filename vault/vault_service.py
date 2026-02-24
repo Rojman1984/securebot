@@ -596,6 +596,26 @@ async def health() -> Dict[str, Any]:
     }
 
 
+class SecretRequest(BaseModel):
+    name: str  # supports dot notation: "anthropic_api_key" or "search.tavily_api_key"
+
+
+@app.post("/secret")
+async def get_secret_endpoint(
+    body: SecretRequest,
+    request: Request,
+    _auth = Depends(auth_required)
+) -> Dict[str, Any]:
+    """
+    Retrieve a named secret (HMAC-authenticated callers only).
+    Supports dot notation for nested keys (e.g. 'search.google_api_key').
+    """
+    value = vault.get_secret(body.name)
+    if value is None:
+        raise HTTPException(status_code=404, detail=f"Secret '{body.name}' not found")
+    return {"name": body.name, "value": value}
+
+
 @app.get("/search/usage")
 async def search_usage(
     request: Request,

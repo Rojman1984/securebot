@@ -14,6 +14,8 @@ import traceback
 import subprocess
 import datetime
 import shutil
+import re
+import textwrap
 
 # ── stdlib HTTP ──────────────────────────────────────────────────────────────
 import urllib.request
@@ -28,7 +30,7 @@ USER_ID               = "roland"
 MEMORY_DIR            = os.path.expanduser("~/securebot/memory")
 VAULT_SECRETS         = os.path.expanduser("~/securebot/vault/secrets/secrets.json")
 PREFS_FILE            = os.path.expanduser("~/.securebot-cli-prefs.json")
-RESPONSE_MODEL        = os.getenv("RESPONSE_MODEL", "llama3:8b")
+RESPONSE_MODEL        = os.getenv("RESPONSE_MODEL", "llama3.2:3b")  # overridden below after .env loads
 REFRESH_INTERVAL      = 3
 MAX_CHAT_LINES        = 100
 SYSTEM_PROMPT_REFRESH = 30
@@ -72,6 +74,24 @@ def _load_gateway_api_key() -> str:
 
 
 GATEWAY_API_KEY = _load_gateway_api_key()
+
+
+def _load_response_model() -> str:
+    """Read RESPONSE_MODEL from ~/securebot/.env, falling back to env var then default."""
+    env_path = os.path.expanduser("~/securebot/.env")
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("RESPONSE_MODEL="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return os.getenv("RESPONSE_MODEL", "llama3.2:3b")
+
+
+RESPONSE_MODEL = _load_response_model()  # read dynamically from .env
+
 
 def _sign_headers(method: str, path: str) -> dict:
     """Generate HMAC auth headers matching common/auth.py sign_request()"""
@@ -322,7 +342,7 @@ class SystemPromptBuilder:
             query = urllib.parse.quote(last_user_msg[:200])
             url   = f"{RAG_URL}/context?query={query}&max_tokens=300"
             data  = http_get(url, timeout=5, signed=True)
-            rag_context = data.get("context", "") or data.get("text", "") or str(data)
+            rag_context = data.get("context") or data.get("text") or ""
         except Exception as e:
             logging.warning(f"RAG unreachable: {e}")
 
@@ -449,7 +469,13 @@ class SecureBotApp:
         curses.noecho()
         self.stdscr.keypad(True)
         self.stdscr.nodelay(True)
-        curses.curs_set(1)
+        # Try highest visibility first; fall back gracefully
+        for _vis in (2, 1):
+            try:
+                curses.curs_set(_vis)
+                break
+            except curses.error:
+                pass
 
         curses.use_default_colors()
         curses.init_pair(C_HEADER,  curses.COLOR_WHITE,  curses.COLOR_BLUE)
@@ -494,16 +520,59 @@ class SecureBotApp:
         curses.curs_set(0)
 
     # ── Startup ───────────────────────────────────────────────────────────────
+    def _ollama_warmup(self):
+        """Send a tiny request to force model load before first user message."""
+        try:
+            payload = json.dumps({
+                "model": RESPONSE_MODEL,
+                "prompt": "hi",
+                "stream": False,
+                "options": {"num_predict": 1}
+            }).encode()
+            req = urllib.request.Request(
+                "http://localhost:11434/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            urllib.request.urlopen(req, timeout=60)
+            self.chat.add("Model warmed up.", curses.color_pair(C_DIM))
+        except Exception as e:
+            self.chat.add(f"Warmup warning: {e}", curses.color_pair(C_YELLOW))
+        finally:
+            self._redraw_needed.set()
+
     def _startup(self):
         self.chat.add("SecureBot CLI v1.0 — /help for commands", curses.color_pair(C_DIM))
         self._redraw_needed.set()
-        # RAG warmup
-        try:
-            url = f"{RAG_URL}/context?query=hello&max_tokens=10"
-            http_get(url, timeout=5, signed=True)
+
+        # RAG warmup with retry loop
+        def rag_warmup_with_retry(max_attempts=5, delay=3):
+            for attempt in range(max_attempts):
+                try:
+                    result = http_get(
+                        f"{RAG_URL}/context?query=hello&max_tokens=10",
+                        signed=True,
+                        timeout=5
+                    )
+                    if result is not None:
+                        return True
+                except Exception:
+                    pass
+                if attempt < max_attempts - 1:
+                    self.chat.add(
+                        f"RAG not ready, retrying ({attempt+1}/{max_attempts})...",
+                        curses.color_pair(C_YELLOW)
+                    )
+                    self._redraw_needed.set()
+                    time.sleep(delay)
+            return False
+
+        rag_ok = rag_warmup_with_retry()
+        if rag_ok:
             self.chat.add("RAG ready.", curses.color_pair(C_GREEN))
-        except Exception as e:
-            self.chat.add(f"[warning] RAG not reachable: {e}", curses.color_pair(C_YELLOW))
+        else:
+            self.chat.add("[warning] RAG not reachable — check /status", curses.color_pair(C_YELLOW))
         self._redraw_needed.set()
 
         # Build system prompt
@@ -511,6 +580,11 @@ class SecureBotApp:
             self.sp_builder.build()
         except Exception as e:
             logging.error(f"Startup sp build error: {e}")
+
+        # Ollama warmup — loads model into VRAM before first user message
+        self.chat.add("Warming up model...", curses.color_pair(C_DIM))
+        self._redraw_needed.set()
+        self._ollama_warmup()
 
         self.chat.add("Ready.", curses.color_pair(C_DIM))
         self._redraw_needed.set()
@@ -934,12 +1008,21 @@ class SecureBotApp:
                     method="POST",
                 )
                 t0 = time.time()
-                with urllib.request.urlopen(req, timeout=90) as resp:
+                with urllib.request.urlopen(req, timeout=120) as resp:
                     data = json.loads(resp.read())
                 elapsed = time.time() - t0
-                response = (data.get("response") or data.get("text") or data.get("message") or str(data))
-                method   = data.get("method", "gateway")
-                self.chat.add(f"🤖 Bot: {response}", curses.color_pair(C_BOT))
+                bot_text = data.get("response") or data.get("text") or data.get("message") or ""
+                meta     = data.get("metadata", {})
+                method   = (meta.get("method") if isinstance(meta, dict) else None) or data.get("method", "gateway")
+                if not bot_text or not bot_text.strip():
+                    self.chat.add(
+                        f"[No response — method: {method}. Try rephrasing.]",
+                        curses.color_pair(C_YELLOW)
+                    )
+                elif bot_text.startswith("{") and "status" in bot_text:
+                    self.chat.add("[Gateway error — raw response received]", curses.color_pair(C_RED))
+                else:
+                    self.chat.add(f"🤖 Bot: {bot_text}", curses.color_pair(C_BOT))
                 self.chat.add(f"   [{method} | {elapsed:.1f}s]", curses.color_pair(C_DIM))
             except urllib.error.URLError as e:
                 self.chat.add(f"Error: Gateway unreachable — {e.reason}", curses.color_pair(C_RED))
@@ -1105,6 +1188,7 @@ class SecureBotApp:
             self._safe_addstr(chat_top + i, 0, line[:w].ljust(w), attr)
 
         # ── Input line ────────────────────────────────────────────────────────
+        _final_cursor = None
         if input_row < h:
             prefix = f"[tone:{self.prefs.tone}|v:{self.prefs.verbosity}] "
             if self._thinking:
@@ -1125,10 +1209,8 @@ class SecureBotApp:
             input_line = prefix_shown + view_buf
             self._safe_addstr(input_row, 0, input_line[:w].ljust(w), curses.color_pair(C_USER))
             cursor_col = min(cursor_col, w - 1)
-            try:
-                self.stdscr.move(input_row, cursor_col)
-            except curses.error:
-                pass
+            # Save position; move AFTER refresh so it is not overwritten
+            _final_cursor = (input_row, cursor_col)
 
         # ── Status row ────────────────────────────────────────────────────────
         if status_row < h and status_row != input_row:
@@ -1139,6 +1221,12 @@ class SecureBotApp:
                 self._safe_addstr(status_row, 0, " " * w, curses.color_pair(C_DIM))
 
         self.stdscr.refresh()
+        # Place cursor AFTER refresh to ensure correct terminal position
+        if _final_cursor:
+            try:
+                self.stdscr.move(*_final_cursor)
+            except curses.error:
+                pass
 
     # ── Drawing helpers ───────────────────────────────────────────────────────
     def _safe_addstr(self, row: int, col: int, text: str, attr: int = 0):
@@ -1165,19 +1253,39 @@ class SecureBotApp:
             return curses.color_pair(C_GREEN)
 
     def _wrap(self, text: str, width: int, attr: int):
-        """Word-wrap text to width, returning list of (line, attr)."""
+        """Word-wrap text with smart paragraph handling for multi-line bot responses."""
         if width <= 0:
             return [(text, attr)]
         result = []
-        while len(text) > width:
-            # Try to break at space
-            break_at = text.rfind(" ", 0, width)
-            if break_at <= 0:
-                break_at = width
-            result.append((text[:break_at], attr))
-            text = text[break_at:].lstrip(" ")
-        result.append((text, attr))
-        return result
+        # Split on blank lines to get paragraphs
+        paragraphs = re.split(r'\n\s*\n', text)
+        for p_idx, para in enumerate(paragraphs):
+            lines = para.split('\n')
+            # Detect structured content: bullets, code fences, headers
+            is_structured = any(
+                l.strip().startswith(('- ', '* ', '• ', '```', '# '))
+                for l in lines if l.strip()
+            )
+            if is_structured:
+                # Preserve structure; word-wrap each line individually
+                for line in lines:
+                    if not line.strip():
+                        result.append(('', attr))
+                    else:
+                        for wl in (textwrap.wrap(line, width) or [line]):
+                            result.append((wl, attr))
+            else:
+                # Prose: join continuation lines, then rewrap as single paragraph
+                joined = ' '.join(l.strip() for l in lines if l.strip())
+                if joined:
+                    for wl in (textwrap.wrap(joined, width) or [joined]):
+                        result.append((wl, attr))
+                else:
+                    result.append(('', attr))
+            # Blank separator between paragraphs (not after the last one)
+            if p_idx < len(paragraphs) - 1:
+                result.append(('', attr))
+        return result or [('', attr)]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

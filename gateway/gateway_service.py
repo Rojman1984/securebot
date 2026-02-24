@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import our orchestrator
-from orchestrator import route_query, SkillMatcher
+from orchestrator import route_query, SkillMatcher, skill_registry
 from common.config import get_config
 from common.auth import SignedClient
 
@@ -69,7 +69,7 @@ class Message(BaseModel):
 class SearchDetector:
     """Detect if query needs web search - now skill-based"""
 
-    def __init__(self, skills_dir: str = "/home/tasker0/securebot/skills"):
+    def __init__(self, skills_dir: str = "/app/skills"):
         """Initialize with skills from directory"""
         self.skills_dir = Path(skills_dir)
         self.config = get_config()
@@ -250,16 +250,40 @@ class GatewayService:
                         system_prompt=message.system
                     )
                 else:
-                    # Search unavailable — fall back to Ollama with no results
-                    logger.warning("Search execution failed for web_search_needed query — falling back to Ollama")
-                    orchestrator_result = await route_query(
-                        query=original_query,
-                        user_id=message.user_id,
-                        vault_url=self.vault_url,
-                        ollama_url=self.ollama_url,
-                        has_search_results=False,
-                        system_prompt=message.system
+                    # Search unavailable — fall back to Ollama directly with a note
+                    logger.warning("Search execution failed for web_search_needed query — falling back to Ollama directly")
+                    _fallback_model = os.getenv("RESPONSE_MODEL", "llama3.2:3b")
+                    _fallback_prompt = (
+                        "I couldn't access real-time search results for this query. "
+                        "Please answer based on your training knowledge, noting any uncertainty. "
+                        f"Query: {original_query}"
                     )
+                    _fallback_result = ""
+                    try:
+                        async with httpx.AsyncClient(timeout=120.0) as _c:
+                            _r = await _c.post(
+                                f"{self.ollama_url}/api/generate",
+                                json={
+                                    "model": _fallback_model,
+                                    "prompt": _fallback_prompt,
+                                    "system": message.system or "",
+                                    "stream": False,
+                                }
+                            )
+                            _fallback_result = _r.json().get("response", "")
+                    except Exception as _e:
+                        logger.error(f"Ollama fallback also failed: {_e}")
+                    if not _fallback_result:
+                        _fallback_result = (
+                            "I couldn't retrieve real-time information for this query. "
+                            "Please check a web browser for current data."
+                        )
+                    orchestrator_result = {
+                        "result": _fallback_result,
+                        "method": "direct_ollama",
+                        "cost": 0.0,
+                        "engine": "ollama",
+                    }
 
             # Calculate processing time
             elapsed = (datetime.now() - start_time).total_seconds()
@@ -355,9 +379,13 @@ gateway = GatewayService()
 
 @app.on_event("startup")
 async def startup_event():
-    """Seed classifier examples on startup"""
+    """Load GLiClass classifier and seed classifier examples on startup"""
     import asyncio
     from orchestrator import seed_classifier_examples_on_startup
+    from gliclass_classifier import load_classifier
+
+    # Load GLiClass into GPU memory — must complete before first request
+    load_classifier(device="cuda:0")
 
     # Run seeding in background (non-blocking)
     asyncio.create_task(
@@ -432,6 +460,18 @@ async def list_skills() -> Dict[str, Any]:
         "status": "success",
         "skills": skills_info,
         "count": len(skills_info)
+    }
+
+
+@app.post("/skills/reload")
+async def reload_skills() -> Dict[str, Any]:
+    """Hot-reload skill registry without container restart."""
+    skill_registry.reload()
+    skills = skill_registry.list_all()
+    return {
+        "status": "ok",
+        "skills_loaded": len(skills),
+        "skills": [s["name"] for s in skills]
     }
 
 

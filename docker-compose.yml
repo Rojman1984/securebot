@@ -34,7 +34,7 @@ services:
     environment:
       - VAULT_URL=http://vault:8200
       - OLLAMA_HOST=http://host.docker.internal:11434
-      - OLLAMA_MODEL=phi4-mini:3.8b
+      - RESPONSE_MODEL=${RESPONSE_MODEL:-llama3.2:3b-instruct-q4_K_M}
       - MEMORY_SERVICE_URL=http://memory-service:8300
       - RAG_URL=http://rag-service:8400
       - SERVICE_SECRET=${SERVICE_SECRET}
@@ -42,8 +42,13 @@ services:
       - ALLOWED_CALLERS=external
       - GATEWAY_API_KEY=${GATEWAY_API_KEY}
       - WEB_CONCURRENCY=1
+      - HF_HOME=/app/.cache/huggingface
+      - SKILLS_DIR=/app/skills
+      - MEMORY_DIR=/memory
     volumes:
-      - /home/tasker0/securebot/skills:/home/tasker0/securebot/skills
+      - ./skills:/app/skills
+      - ./memory:/memory
+      - ~/.cache/huggingface:/app/.cache/huggingface
     networks:
       - securebot
     ports:

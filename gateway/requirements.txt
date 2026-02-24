@@ -3,3 +3,5 @@ uvicorn==0.24.0
 httpx
 pydantic
 pyyaml
+anthropic
+gliclass==0.1.16

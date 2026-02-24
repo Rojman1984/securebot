@@ -552,29 +552,6 @@ def _format_tasks(tasks: Any) -> str:
         return "\n".join(lines) if lines else "No tasks found."
     return str(tasks)
 
-def determine_routing_path(query: str) -> tuple[str, float, dict | None]:
-    """
-    Acts as the master pre-router.
-    1. Uses GLiClass to determine the true intent.
-    2. If it's an action, performs the deterministic skill lookup.
-    3. Pipes both the intent and the matched skill down the line.
-    """
-    from gliclass_classifier import classify_intent
-
-    # 1. Ask GLiClass for the intent
-    intent, confidence = classify_intent(query)
-    matched_skill = None
-
-    # 2. ONLY do a skill lookup if GLiClass confirms the user wants an action
-    if intent in ("action", "task_action"):
-        matched_skill = skill_registry.find_by_trigger(query)
-
-        if matched_skill:
-            logger.info("Pre-router mapped ACTION to specific skill: %s", matched_skill.get('name'))
-        else:
-            logger.info("Pre-router detected ACTION, but no existing skill matched (Will escalate to Haiku).")
-
-    return intent, confidence, matched_skill
 
 async def route_query(
     query: str,
@@ -624,10 +601,23 @@ async def route_query(
                 "intent": "search", "cost": 0.0, "engine": "ollama"}
 
     # ─────────────────────────────────────────────
-    # THE MASTER PRE-ROUTER
-    # GLiClass acts as the gatekeeper.
+    # Deterministic skill trigger check FIRST
+    # Key principle: tool routing is deterministic.
+    # Trigger match bypasses GLiClass entirely.
     # ─────────────────────────────────────────────
-    intent, confidence, matched_skill = determine_routing_path(query)
+    skill = skill_registry.find_by_trigger(query)
+    if skill:
+        logger.info("Skill trigger match: %s — executing (pre-classification)", skill.get("name"))
+        response = await execute_skill(skill, query, ollama_url, user_id, _rag_url, signed_client)
+        return {
+            "result": response, "response": response,
+            "method": "skill_execution",
+            "skill_used": skill.get("name"),
+            "skill_created": None,
+            "cost": 0.0, "engine": "ollama"
+        }
+
+    intent, confidence = classify_intent(query)
     logger.info("Intent: %s (%.3f) | %s", intent, confidence, query[:60])
 
     # ─────────────────────────────────────────────
@@ -654,14 +644,15 @@ async def route_query(
             intent = "knowledge"
 
     elif intent in ("action", "task_action"):
-        # We ALREADY have the skill if one existed, thanks to the pre-router!
-        if matched_skill:
-            logger.info("Skill match: %s — executing locally", matched_skill.get("name"))
-            response = await execute_skill(matched_skill, query, ollama_url, user_id, _rag_url, signed_client)
+        skill = skill_registry.find_by_trigger(query)  # second-chance check with action intent
+
+        if skill:
+            logger.info("Skill match: %s — executing locally", skill.get("name"))
+            response = await execute_skill(skill, query, ollama_url, user_id, _rag_url, signed_client)
             return {
                 "result": response, "response": response,
                 "method": "skill_execution",
-                "skill_used": matched_skill.get("name"),
+                "skill_used": skill.get("name"),
                 "skill_created": None,
                 "cost": 0.0, "engine": "ollama"
             }
@@ -683,7 +674,7 @@ async def route_query(
                     }
             logger.warning("Skill generation failed — falling back to knowledge")
             intent = "knowledge"
-    # ... (Keep everything from here down exactly as you have it!) ...
+
     elif intent == "task":
         try:
             tasks = await _get_tasks_from_memory(_memory_url, signed_client)
