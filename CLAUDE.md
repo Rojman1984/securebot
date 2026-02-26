@@ -4,140 +4,129 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-SecureBot is a cost-optimized, self-hosted AI assistant that routes queries intelligently between free local inference (Ollama) and the Claude API. The core value proposition is ~97% cost reduction via skill reuse and local-first routing.
+SecureBot is a cost-optimized, self-hosted AI assistant that routes queries intelligently between free local inference (Ollama) and the Claude API. The core value proposition is ~97% cost reduction via skill reuse, zero-shot intent routing, and local-first execution.
 
 ## Running the Project
 
 ```bash
 # Start all services
-docker-compose up -d
+docker compose up -d --build
 
 # Run the TUI CLI
 python securebot-cli.py
 
 # Health check all services
-curl http://localhost:8080/health   # Gateway
-curl http://localhost:8200/health   # Vault
-curl http://localhost:8300/health   # Memory
-curl http://localhost:8400/health   # RAG
+curl [http://127.0.0.1:8080/health](http://127.0.0.1:8080/health)   # Gateway
+curl [http://127.0.0.1:8200/health](http://127.0.0.1:8200/health)   # Vault
+curl [http://127.0.0.1:8300/health](http://127.0.0.1:8300/health)   # Memory
+curl [http://127.0.0.1:8400/health](http://127.0.0.1:8400/health)   # RAG
 
 # View logs
-docker logs gateway
-docker logs vault
-# CLI debug logs: /tmp/securebot-cli.log
+docker compose logs -f gateway
 ```
-
-## Running Tests
-
-```bash
-python test_intent_classifier.py
-python test_classifier_simple.py
-python test_hybrid_classifier.py
-python test_classifier_improvements.py
-```
-
-Tests run against a live Ollama instance and focus on classification accuracy. There is no central test runner or mocking framework.
 
 ## Service Ports
 
-| Service  | Port | Purpose                           |
-|----------|------|-----------------------------------|
-| Gateway  | 8080 | Main API entry point              |
-| Vault    | 8200 | Secrets storage & multi-provider search |
-| Memory   | 8300 | Persistent user context           |
-| RAG      | 8400 | ChromaDB vector embeddings        |
-| Ollama   | 11434 | Local LLM (on host, not Docker)  |
+| Service | Port  | Purpose                                 |
+| ------- | ----- | --------------------------------------- |
+| Gateway | 8080  | Main API entry point & Orchestrator     |
+| Vault   | 8200  | Secrets storage & multi-provider search |
+| Memory  | 8300  | Persistent user context                 |
+| RAG     | 8400  | ChromaDB vector embeddings              |
+| Ollama  | 11434 | Local LLM (on host, not Docker)         |
 
 Only the Gateway is exposed externally. All inter-service traffic is on the `securebot` Docker bridge network.
 
 ## Architecture & Request Flow
 
-```
-User → Gateway (8080) → Orchestrator
-                              │
-              ┌───────────────┼────────────────┐
-              ▼               ▼                ▼
-         Ollama (free)   Claude API ($0.006)  Skill Exec (free)
-              │                               ▲
-              └──── Skill Creation ($0.10) ───┘
+```text
+User Query
+    ↓
+[1] GLiClass Classification (144M params, <50ms)
+    │
+    ├── search    → Vault Web Search → llama3.2:3b summary (No RAG)
+    ├── task      → Memory Service Direct Read → llama3.2:3b (No RAG)
+    ├── knowledge → RAG Context Retrieval → llama3.2:3b (Uses ChromaDB)
+    ├── chat      → RAG Context Retrieval → llama3.2:3b (Uses ChromaDB)
+    └── action    → [2] Skill Registry (Deterministic exact match)
+                        ↓
+                    Match found?
+                    ├── YES → Execute Bash/Ollama locally (Free)
+                    └── NO  → [3] Haiku API creates skill → Save → Execute (~$0.01)
 ```
 
-The orchestrator in `gateway/orchestrator.py` makes routing decisions:
-1. **SearchDetector** — keyword scan to detect web search intent
-2. **SkillMatcher** — scans `skills/` for a SKILL.md that matches the query
-3. **ComplexityClassifier** — routes to `simple_ollama | skill_execution | skill_creation | direct_claude`
-4. **IntentClassifier** — KNOWLEDGE vs ACTION classification for further routing
-
-The Vault service handles all external API calls (Google, Tavily, DuckDuckGo) so API keys are never passed to or visible by AI models.
+**Key Principle:** Tool routing is deterministic. Memory retrieval is probabilistic. **These two pipelines must never merge.** RAG is consulted ONLY for knowledge and chat intents. Legacy LLM-based classifiers (`phi4-mini`) have been retired.
 
 ## Key Files
 
-- `gateway/orchestrator.py` — All routing intelligence; the most complex file (~41KB)
-- `gateway/gateway_service.py` — FastAPI `/message` and `/health` endpoints
-- `vault/vault_service.py` — Secret isolation + SearchOrchestrator with provider fallback
-- `services/memory/memory_service.py` — Manages `soul.md`, `user.md`, `session.md`, `tasks.json`
-- `services/rag/rag_service.py` — ChromaDB integration; three collections: memory, conversations, classifier_examples
-- `common/auth.py` — HMAC-SHA256 inter-service auth with replay prevention (30s window + nonce)
-- `common/config.py` — ConfigManager loading `~/.securebot/config.yml` with fallback defaults
-- `securebot-cli.py` — Curses TUI; reads `~/securebot/.env` for `SERVICE_SECRET`
+- `gateway/orchestrator.py` — The core routing pipeline. Contains the master pre-router, strict pipeline separation, and `_sanitize_for_cloud` privacy layer.
+- `gateway/gliclass_classifier.py` — Zero-shot intent classifier. Loaded once into GPU/RAM at startup.
+- `gateway/gateway_service.py` — FastAPI endpoints.
+- `vault/vault_service.py` — Secret isolation + SearchOrchestrator with provider fallback.
+- `services/memory/memory_service.py` — Manages `soul.md`, `user.md`, `session.md`, `tasks.json`.
+- `services/rag/rag_service.py` — ChromaDB integration.
+- `securebot-cli.py` — Curses TUI. Connects to `127.0.0.1` explicitly.
 
 ## Skills System
 
-Skills live in `skills/<skill-name>/SKILL.md` with YAML frontmatter:
+Skills live in `skills/<skill-name>/SKILL.md` with YAML frontmatter.
 
 ```yaml
 ---
-name: skill-name
-description: "trigger keywords used for matching"
-category: search|code|stt|tts|general
-priority: 1        # lower = higher priority
-requires_api_key: true
-execution: vault-tool|ollama|claude-code
-tool_name: optional_tool_name
+name: datetime-now
+description: Returns the current system date and time
+triggers:
+  - what time is it
+  - today's date
+execution_mode: bash
+timeout: 5
 ---
 ```
 
-Matching scores: exact name match (+5), trigger word match (+3 each), description overlap (+0.5/word). A skill is selected if score ≥ 5. Skills execute free via Ollama after initial creation via Claude API.
+* **Matching:** Exact substring match based on `triggers` array in the frontmatter. (The legacy +5/+3 scoring system is retired).
+* **Execution (Bash):** Scripts are written to a temp file and executed via `subprocess.run` on the host OS as a locked-down user (`sudo -u securebot-scripts`). The `stdout` is then passed to Ollama to be wrapped in natural language.
+* **Execution (Ollama):** Pure prompt manipulation using `$ARGUMENTS`.
 
-## Inter-Service Authentication
+## Inter-Service Authentication & Security
 
-All requests between services use HMAC-SHA256. Required headers:
-- `X-Service-ID`, `X-Timestamp`, `X-Nonce`, `X-Signature`
-
-Use `common/auth.py`'s `SignedClient` for authenticated calls and `verify_request()` as a FastAPI dependency on protected routes. Each service has an `ALLOWED_CALLERS` list.
+* **HMAC-SHA256:** All requests between services use `X-Service-ID`, `X-Timestamp`, `X-Nonce`, `X-Signature`.
+* **Bash Sandboxing:** The `gateway` container executes bash scripts using `sudo -u securebot-scripts` configured via host-side sudoers, preventing root container escapes.
+* **Anonymization Layer:** Before sending requests to Anthropic's Haiku API for skill creation, `orchestrator.py` runs `_sanitize_for_cloud`. This regex engine redacts emails, IPs, MAC addresses, SSH keys, and explicit keywords defined in the `.env` via `REDACT_WORDS`.
 
 ## Configuration
 
-User config at `~/.securebot/config.yml` (see `config/config.example.yml`). Key options:
-- `skills.disabled_skills` — list of skills to skip
-- `skills.search_priority` — override search provider order
-- `gateway.search_detection` — `strict | normal | relaxed`
-- `orchestrator.ollama_model` — default local model (e.g. `phi4-mini:3.8b`)
-- `orchestrator.claude_model` — model for skill creation
+* `vault/secrets/secrets.json` — API keys. Injected by Vault at runtime. Never passed to AI models.
+* `.env` — Holds `GATEWAY_API_KEY`, `SERVICE_SECRET`, and `REDACT_WORDS` (for the anonymization layer).
 
-## Secrets
+## Documentation Discrepancies To Correct.
 
-API keys live in `vault/secrets/secrets.json` (gitignored). The Vault service injects them into tool calls at runtime. Access via `vault.get_secret("search.google_api_key")`. Never pass secrets directly to AI model context.
+** **The Routing Logic is Outdated**
 
-## CLI Commands
+- Currently in Docs: Both CLAUDE.md and ARCHITECTURE.md describe a pipeline using SearchDetector, a complex SkillMatcher scoring system (+5 for name, +3 fortrigger), and a ComplexityClassifier.
 
-`/status`, `/vault`, `/memory`, `/edit`, `/clear`, `/tone [1-3]`, `/verbosity [1-5]`, `/help`
+- The Reality: These have been retired. The orchestrator now uses a Master Pre-Router. GLiClass evaluates the intent first (in <50ms), and if it's an action, the SkillRegistry does a deterministic trigger lookup. Pipeline A (Deterministic) and Pipeline B (RAG) are strictly separated.
 
-Default model for responses: `llama3:8b` (override with `RESPONSE_MODEL` env var).
+** **Bash Skill Execution is Missing**
+
+- Currently in Docs: Skills execute via Ollama or Claude Code.
+
+- The Reality: You implemented a highly secure bash execution mode. Skills are saved as .sh scripts to a temporary file and executed on the host OS via  sudo -u securebot-scripts, with the stdout captured and wrapped by llama3.2:3b.
+
+** **Pending Tasks are Complete**
+
+- Currently in Docs: CLAUDE.md lists the "Anonymized memory layer" as pending.
+
+- The Reality: _sanitize_for_cloud is fully implemented using Regex + explicit environment variables (REDACT_WORDS), successfully scrubbing user.md before sending it to the Haiku API.
 
 ## Do Not Touch
 
-- `vault/secrets/secrets.json` — never overwrite programmatically
-- `memory/soul.md` — chmod 444, read-only identity file; do not modify
-- `chroma/` — do not delete without re-embedding all documents
-- `.env` — `ANTHROPIC_API_KEY` is project-scoped only, never export to global shell
+- `vault/secrets/secrets.json` — never overwrite programmatically.
+- `memory/soul.md` — chmod 444, read-only identity file.
+- **Skills Collection:** Do not embed `SKILL.md` files into ChromaDB. Skills are loaded directly into RAM by the `SkillRegistry` object.
 
 ## Active Development Direction
 
 **Next phase:** Distributed specialist agent fleet — SearchBot, CodeBot, MemoryBot, ReasonBot as isolated containers. SecureBot orchestrates; specialists receive sanitized payloads only (need-to-know context isolation).
 
-**Pending:** Anonymized memory layer before implementing the Haiku router — memory files currently sent verbatim to the Anthropic API; this is a privacy concern that must be resolved first.
-
-## Hardware
-
-Ryzen 5 8600G + GTX 1050 Ti · 16GB RAM · SecureBot-P2 · McAllen TX
+**Hardware:**
+Ryzen 5 8600G + GTX 1050 Ti · 16GB RAM · SecureBot-P2 · Mission, TX

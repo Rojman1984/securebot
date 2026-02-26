@@ -12,7 +12,7 @@ import chromadb
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -36,6 +36,9 @@ ALLOWED_CALLERS = os.getenv("ALLOWED_CALLERS", "gateway,memory-service,heartbeat
 
 # Create auth dependency
 auth_required = create_auth_dependency(ALLOWED_CALLERS)
+
+# All non-health routes require HMAC auth
+protected = APIRouter(dependencies=[Depends(auth_required)])
 
 # Initialize ChromaDB
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
@@ -201,10 +204,8 @@ async def health_check():
         )
 
 
-@app.post("/embed/memory")
-async def embed_memory(
-    request: Request
-):
+@protected.post("/embed/memory")
+async def embed_memory():
     """Re-embed all memory files. Requires HMAC authentication."""
     try:
         chunks_embedded = await embed_memory_files()
@@ -217,11 +218,9 @@ async def embed_memory(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/embed/conversation")
+@protected.post("/embed/conversation")
 async def embed_conversation(
     turn: ConversationTurn,
-    request: Request,
-    _auth = Depends(auth_required)
 ):
     """Store a conversation turn. Requires HMAC authentication."""
     try:
@@ -258,13 +257,11 @@ async def embed_conversation(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/context")
+@protected.get("/context")
 async def get_context(
     query: str,
     max_tokens: int = 300,
     user_id: Optional[str] = None,
-    request: Request = None,
-    _auth = Depends(auth_required)
 ):
     """
     Get relevant context for a query.
@@ -343,12 +340,10 @@ async def get_context(
         }
 
 
-@app.get("/classify/examples")
+@protected.get("/classify/examples")
 async def get_classifier_examples(
     query: str,
     k: int = 3,
-    request: Request = None,
-    _auth = Depends(auth_required)
 ):
     """
     Get k nearest neighbor examples for query classification.
@@ -395,10 +390,8 @@ async def get_classifier_examples(
         return {"examples": []}
 
 
-@app.post("/classify/seed")
-async def seed_classifier_examples(
-    request: Request
-):
+@protected.post("/classify/seed")
+async def seed_classifier_examples():
     """
     Seed the classifier_examples collection with hardcoded examples.
     Idempotent - only seeds if collection is empty.
@@ -599,11 +592,8 @@ async def seed_classifier_examples(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/summarize/session")
-async def summarize_session(
-    request: Request,
-    _auth = Depends(auth_required)
-):
+@protected.post("/summarize/session")
+async def summarize_session():
     """
     Summarize current session.md to 200 tokens max
     Requires HMAC authentication.
@@ -651,6 +641,9 @@ async def summarize_session(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+app.include_router(protected)
 
 
 if __name__ == "__main__":

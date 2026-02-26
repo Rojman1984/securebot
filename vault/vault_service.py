@@ -7,7 +7,7 @@ Author: SecureBot Project
 License: MIT
 """
 
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel
 import os
 import sys
@@ -464,12 +464,13 @@ ALLOWED_CALLERS = os.getenv("ALLOWED_CALLERS", "gateway,rag-service,memory-servi
 # Create auth dependency
 auth_required = create_auth_dependency(ALLOWED_CALLERS)
 
+# All non-health routes require HMAC auth
+protected = APIRouter(dependencies=[Depends(auth_required)])
 
-@app.post("/execute")
+
+@protected.post("/execute")
 async def execute_tool(
     tool_request: ToolRequest,
-    request: Request,
-    _auth = Depends(auth_required)
 ) -> Dict[str, Any]:
     """
     Execute tool with injected secrets
@@ -600,11 +601,9 @@ class SecretRequest(BaseModel):
     name: str  # supports dot notation: "anthropic_api_key" or "search.tavily_api_key"
 
 
-@app.post("/secret")
+@protected.post("/secret")
 async def get_secret_endpoint(
     body: SecretRequest,
-    request: Request,
-    _auth = Depends(auth_required)
 ) -> Dict[str, Any]:
     """
     Retrieve a named secret (HMAC-authenticated callers only).
@@ -616,11 +615,8 @@ async def get_secret_endpoint(
     return {"name": body.name, "value": value}
 
 
-@app.get("/search/usage")
-async def search_usage(
-    request: Request,
-    _auth = Depends(auth_required)
-) -> Dict[str, Any]:
+@protected.get("/search/usage")
+async def search_usage() -> Dict[str, Any]:
     """
     Get current search usage statistics
     Useful for monitoring rate limit consumption
@@ -637,6 +633,9 @@ async def search_usage(
         "usage": usage,
         "timestamp": datetime.now().isoformat()
     }
+
+
+app.include_router(protected)
 
 
 @app.get("/")

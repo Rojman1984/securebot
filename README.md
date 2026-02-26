@@ -28,7 +28,7 @@ Created by **Roland (Rojman1984)** • Built with AI assistance
 - 🔒 **Security First** - Secrets isolated in vault, never exposed to AI models
 - 🔍 **Multi-Provider Search** - Google Custom Search, Tavily, DuckDuckGo with auto-fallback
 - 🧩 **Reusable Skills** - Create AI capabilities once, use infinitely at zero marginal cost
-- 📊 **Smart Routing** - Complexity classification routes simple → Ollama, complex → Claude
+- 📊 **Zero-Shot Routing** - GLiClass (144M params, <50ms) routes by intent: search, task, knowledge, chat, or action — no heuristics, no scoring
 - 🧠 **Memory & Continuity** - Persistent context across sessions with system-native automation
 - 🤖 **System-Native Heartbeat** - systemd timers (not Python loops) for reliability
 - ⚙️ **Automation Skills** - Teach cron, systemd, bash, and ansible best practices
@@ -118,14 +118,19 @@ See [docs/HARDWARE.md](docs/HARDWARE.md) for detailed setup guides and benchmark
             └─────────────┬───────────────────┘
                           ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                  ORCHESTRATOR (Smart Routing)                   │
-│  ┌───────────────────────────────────────────────────────┐     │
-│  │  1. Skill Matching    → Execute with Ollama (FREE)    │     │
-│  │  2. Search Needed     → Multi-provider + Ollama       │     │
-│  │  3. Simple Query      → Direct Ollama (FREE)          │     │
-│  │  4. Complex One-Off   → Claude API ($0.006)           │     │
-│  │  5. Skill-Worthy      → Create Skill + Execute ($0.10)│     │
-│  └───────────────────────────────────────────────────────┘     │
+│              ORCHESTRATOR (Zero-Shot Routing)                   │
+│                                                                 │
+│  [1] GLiClass Classification (144M params · <50ms)             │
+│      │                                                          │
+│      ├── search    → Vault Web Search → Ollama summary (FREE)  │
+│      ├── task      → Memory tasks.json → Ollama summary (FREE) │
+│      ├── knowledge → ChromaDB RAG context → Ollama (FREE)      │
+│      ├── chat      → ChromaDB RAG context → Ollama (FREE)      │
+│      └── action    → [2] SkillRegistry (deterministic match)   │
+│                           ├── Match  → Execute locally (FREE)  │
+│                           └── No match → [3] Haiku creates     │
+│                                          skill → Execute (~$0.01│
+│                                          one-time)              │
 └─────────────────────────────────────────────────────────────────┘
                           │
                           ▼
@@ -155,7 +160,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for technical deep dive.
 
 1. **Local Inference** - Ollama runs on YOUR hardware (zero marginal cost)
 2. **Skill Reuse** - Create skill once with Claude ($0.10), execute unlimited times FREE
-3. **Smart Routing** - Simple queries use free local models, complex queries use paid API
+3. **Zero-Shot Routing** - GLiClass intent classification routes all queries to the optimal free local path; cloud API used only for new skill creation
 4. **Free Search Tiers** - Google (100/day), Tavily (1000/mo), DuckDuckGo (unlimited)
 5. **Secrets Management** - No accidental API calls leaking credentials
 

@@ -5,7 +5,7 @@ Minimal FastAPI service for memory file management.
 Just reads/writes memory files, no complex logic.
 """
 
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -46,6 +46,9 @@ signed_client = SignedClient(SERVICE_ID, SERVICE_SECRET) if SERVICE_SECRET else 
 
 # Create auth dependency
 auth_required = create_auth_dependency(ALLOWED_CALLERS)
+
+# All non-health routes require HMAC auth
+protected = APIRouter(dependencies=[Depends(auth_required)])
 
 
 # Models
@@ -143,38 +146,27 @@ async def health_check():
 
 
 # Memory endpoints
-@app.get("/memory/soul")
-async def get_soul(
-    request: Request,
-    _auth = Depends(auth_required)
-):
+@protected.get("/memory/soul")
+async def get_soul():
     """Get SecureBot's soul/identity. Requires HMAC authentication."""
     return {"content": read_file(SOUL_FILE)}
 
 
-@app.get("/memory/user")
-async def get_user(
-    request: Request,
-    _auth = Depends(auth_required)
-):
+@protected.get("/memory/user")
+async def get_user():
     """Get user profile. Requires HMAC authentication."""
     return {"content": read_file(USER_FILE)}
 
 
-@app.get("/memory/session")
-async def get_session(
-    request: Request,
-    _auth = Depends(auth_required)
-):
+@protected.get("/memory/session")
+async def get_session():
     """Get current session context. Requires HMAC authentication."""
     return {"content": read_file(SESSION_FILE)}
 
 
-@app.post("/memory/session")
+@protected.post("/memory/session")
 async def update_session(
     update: SessionUpdate,
-    request: Request,
-    _auth = Depends(auth_required)
 ):
     """Update session context fields. Requires HMAC authentication."""
     try:
@@ -216,11 +208,8 @@ async def update_session(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/memory/context")
-async def get_combined_context(
-    request: Request,
-    _auth = Depends(auth_required)
-):
+@protected.get("/memory/context")
+async def get_combined_context():
     """Get combined context for Ollama prompts. Requires HMAC authentication."""
     try:
         soul = read_file(SOUL_FILE)
@@ -245,20 +234,15 @@ async def get_combined_context(
 
 
 # Task endpoints
-@app.get("/tasks")
-async def get_tasks(
-    request: Request,
-    _auth = Depends(auth_required)
-):
+@protected.get("/tasks")
+async def get_tasks():
     """Get all tasks. Requires HMAC authentication."""
     return read_json(TASKS_FILE)
 
 
-@app.post("/tasks")
+@protected.post("/tasks")
 async def create_task(
     task: TaskCreate,
-    request: Request,
-    _auth = Depends(auth_required)
 ):
     """Add a new task. Requires HMAC authentication."""
     try:
@@ -295,12 +279,10 @@ async def create_task(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/tasks/{task_id}")
+@protected.put("/tasks/{task_id}")
 async def update_task(
     task_id: str,
     update: TaskUpdate,
-    request: Request,
-    _auth = Depends(auth_required)
 ):
     """Update a task. Requires HMAC authentication."""
     try:
@@ -339,11 +321,9 @@ async def update_task(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/tasks/{task_id}/complete")
+@protected.post("/tasks/{task_id}/complete")
 async def complete_task(
     task_id: str,
-    request: Request,
-    _auth = Depends(auth_required)
 ):
     """Mark task as completed and move to completed list. Requires HMAC authentication."""
     try:
@@ -382,11 +362,8 @@ async def complete_task(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/memory/heartbeat")
-async def get_heartbeat(
-    request: Request,
-    _auth = Depends(auth_required)
-):
+@protected.get("/memory/heartbeat")
+async def get_heartbeat():
     """Get last 50 lines of heartbeat log. Requires HMAC authentication."""
     try:
         with open(HEARTBEAT_LOG, 'r') as f:
@@ -397,6 +374,9 @@ async def get_heartbeat(
         return {"lines": []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+app.include_router(protected)
 
 
 if __name__ == "__main__":

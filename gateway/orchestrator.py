@@ -369,12 +369,25 @@ async def haiku_generate_skill(
 ) -> dict:
     """
     Generate a new skill via Haiku when no local match exists.
-    Privacy: request is sanitized before leaving the system.
-    Haiku never sees memory context, soul.md, or personal identifiers.
+    Privacy: request AND user profile are sanitized before leaving the system.
+    Haiku receives sanitized system context (OS, hardware, paths) to tailor
+    bash scripts to the user's actual environment. It never sees soul.md,
+    raw memory files, or any personal identifiers.
     Cost: ~$0.01 per skill (one-time — future executions are free).
     """
     sanitized = _sanitize_for_cloud(user_request)
     logger.info("Haiku skill generation request: %s", sanitized[:80])
+
+    # Load user profile for architecture context; sanitize before sending
+    user_md_path = Path(os.getenv("MEMORY_DIR", "/memory")) / "user.md"
+    sanitized_profile = ""
+    try:
+        raw_profile = user_md_path.read_text(encoding="utf-8").strip()
+        if raw_profile:
+            sanitized_profile = _sanitize_for_cloud(raw_profile)
+            logger.info("User profile loaded and sanitized for Haiku (%d chars)", len(sanitized_profile))
+    except Exception as e:
+        logger.debug("Could not load user.md for skill context: %s", e)
 
     try:
         api_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -401,13 +414,27 @@ async def haiku_generate_skill(
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
+
+        # Build user message — inject sanitized profile so Haiku can tailor
+        # bash scripts to the user's actual OS, hardware, and path layout.
+        if sanitized_profile:
+            enhanced_prompt = (
+                f"Generate a skill for: {sanitized}\n\n"
+                f"---\n"
+                f"User system context (sanitized — use to tailor bash scripts to "
+                f"this environment, e.g. correct paths, package manager, OS):\n"
+                f"{sanitized_profile}"
+            )
+        else:
+            enhanced_prompt = f"Generate a skill for: {sanitized}"
+
         message = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=1024,
             system=SKILL_GENERATION_SYSTEM_PROMPT,
             messages=[{
                 "role": "user",
-                "content": f"Generate a skill for: {sanitized}"
+                "content": enhanced_prompt
             }]
         )
         skill_content = message.content[0].text
@@ -436,16 +463,50 @@ def _sanitize_for_cloud(text: str) -> str:
     """
     Strip personal identifiers before sending to cloud API.
     This is the anonymization gate — Haiku sees request type, not personal data.
+
+    Redacts:
+    - Email addresses
+    - Phone numbers (US format)
+    - IPv4 addresses
+    - MAC addresses (colon or hyphen separated)
+    - SSH/PEM private key blocks
+    - Keywords from REDACT_WORDS env var (comma-separated, case-insensitive)
     """
     sanitized = text
+
+    # Email addresses
     sanitized = re.sub(
         r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
         '[EMAIL]', sanitized
     )
+
+    # US phone numbers
     sanitized = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[PHONE]', sanitized)
+
+    # IPv4 addresses
     sanitized = re.sub(
         r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '[IP]', sanitized
     )
+
+    # MAC addresses (xx:xx:xx:xx:xx:xx or xx-xx-xx-xx-xx-xx)
+    sanitized = re.sub(
+        r'\b([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b',
+        '[MAC]', sanitized
+    )
+
+    # SSH / PEM private key blocks (multi-line)
+    sanitized = re.sub(
+        r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----',
+        '[SSH_KEY]', sanitized, flags=re.DOTALL
+    )
+
+    # Explicit REDACT_WORDS from environment (comma-separated, case-insensitive)
+    redact_words_env = os.getenv("REDACT_WORDS", "Roland,Rolando,Mac")
+    for word in redact_words_env.split(","):
+        word = word.strip()
+        if word:
+            sanitized = re.sub(re.escape(word), '[REDACTED]', sanitized, flags=re.IGNORECASE)
+
     return sanitized.strip()
 
 
