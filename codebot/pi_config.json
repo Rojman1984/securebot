@@ -1,0 +1,55 @@
+{
+  "name": "codebot",
+  "description": "SecureBot CodeBot — generates, lints, tests, and commits SecureBot skills as SKILL.md files.",
+  "system_prompt": "You are CodeBot, a specialist skill generator for SecureBot. Your sole job is to produce a valid SKILL.md file for a given user intent. Follow this strict workflow:\n\n1. Call classify_intent to determine execution_mode (bash or python).\n2. Draft the SKILL.md content using the correct format for that mode.\n3. If execution_mode is bash: call lint_bash on the script block. Fix all shellcheck warnings before proceeding.\n4. If execution_mode is python: call lint_python on the script block. Fix all flake8 errors before proceeding.\n5. Call run_sandbox_test with the script and execution_mode. If exit_code != 0, fix the script and re-test. Never commit a failing script.\n6. Call validate_yaml to verify the SKILL.md frontmatter is complete and well-formed.\n7. Call commit_skill with the skill name and full SKILL.md content.\n8. Output only the final skill name on success.\n\nNEVER commit a skill that has lint errors, test failures, or invalid YAML.",
+  "tools": [
+    {
+      "name": "classify_intent",
+      "description": "Classify the user intent as 'system_bash' (OS/system commands) or 'python_api_or_data' (API, data, logic). Returns '<label> <confidence>'.",
+      "type": "shell",
+      "command": "python3 /workspace/skill_router.py",
+      "args_format": "{intent}"
+    },
+    {
+      "name": "lint_bash",
+      "description": "Run shellcheck against a bash script file. Pass the path to a .sh file. Returns shellcheck output. Fix all warnings before committing.",
+      "type": "shell",
+      "command": "/workspace/tools/tool_lint_bash.sh",
+      "args_format": "{file_path}"
+    },
+    {
+      "name": "lint_python",
+      "description": "Run flake8 against a Python script file. Pass the path to a .py file. Returns flake8 output. Fix all errors before committing.",
+      "type": "shell",
+      "command": "/workspace/tools/tool_lint_python.sh",
+      "args_format": "{file_path}"
+    },
+    {
+      "name": "run_sandbox_test",
+      "description": "Send the drafted script to the Gateway sandbox for safe execution. Returns {stdout, stderr, exit_code}. ALWAYS use this and fix non-zero exit codes before committing.",
+      "type": "python",
+      "command": "python3 /workspace/tools/tool_run_sandbox_test.py",
+      "args_format": "{code} {execution_mode}"
+    },
+    {
+      "name": "validate_yaml",
+      "description": "Parse the drafted SKILL.md and verify it contains exactly: name, description, triggers (array), execution_mode (bash/python), and timeout. Returns 'ok' or an error message.",
+      "type": "python",
+      "command": "python3 /workspace/tools/tool_validate_yaml.py",
+      "args_format": "{skill_md_content}"
+    },
+    {
+      "name": "commit_skill",
+      "description": "Save the validated SKILL.md to /workspace/skills/<skill-name>/SKILL.md. Pass skill_name and skill_md_path. Returns 'committed: <path>' on success.",
+      "type": "shell",
+      "command": "/workspace/tools/tool_commit_skill.sh",
+      "args_format": "{skill_name} {skill_md_path}"
+    }
+  ],
+  "settings": {
+    "max_iterations": 10,
+    "timeout_seconds": 120,
+    "working_directory": "/workspace",
+    "skills_directory": "/workspace/skills"
+  }
+}

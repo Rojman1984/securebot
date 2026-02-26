@@ -11,6 +11,22 @@ SecureBot implements defense-in-depth security with multiple layers:
 
 ---
 
+## Verified Endpoint Protection (as of 2026-02-26)
+
+`Depends(verify_service_request)` is wired to all protected endpoints via the `APIRouter` pattern. The following has been verified:
+
+| Service | Protected Endpoints | Auth Method | Unprotected |
+|---------|---------------------|-------------|-------------|
+| vault (8200) | `/execute`, `/search`, `/secrets/*`, `/secret` | HMAC-SHA256 | `/health` |
+| memory (8300) | `/memory/*`, `/tasks/*` | HMAC-SHA256 | `/health` |
+| rag (8400) | `/embed/*`, `/classify/*`, `/context` | HMAC-SHA256 | `/health` |
+| gateway (8080) | `/message` | API key (X-API-Key) | `/health` |
+| gateway (8080) | `/internal/test-skill` | HMAC-SHA256 (codebot only) | — |
+
+All three internal services (vault, memory, rag) return **401 Unauthorized** on unsigned requests. `/health` endpoints on all services remain public for Docker healthchecks.
+
+---
+
 ## Inter-Service Authentication
 
 ### Security Model
@@ -64,11 +80,12 @@ All rejections are logged with:
 
 | Service | Can Call | Cannot Call |
 |---------|----------|-------------|
-| **gateway** | vault, memory-service, rag-service | (none - gateway is orchestrator) |
+| **gateway** | vault, memory-service, rag-service, codebot | (none - gateway is orchestrator) |
 | **vault** | (none - receives only) | All services (vault doesn't make outbound calls) |
-| **memory-service** | rag-service | vault, gateway |
-| **rag-service** | memory-service | vault, gateway |
-| **heartbeat** | gateway, memory-service, rag-service | vault |
+| **memory-service** | rag-service | vault, gateway, codebot |
+| **rag-service** | memory-service | vault, gateway, codebot |
+| **codebot** | gateway (/internal/test-skill only) | vault, memory-service, rag-service |
+| **heartbeat** | gateway, memory-service, rag-service | vault, codebot |
 | **EXTERNAL** | (none) | ALL - external requests are rejected |
 
 ### Service Configurations
@@ -92,6 +109,11 @@ gateway,rag-service,heartbeat
 **RAG Service** (`ALLOWED_CALLERS`):
 ```bash
 gateway,memory-service,heartbeat
+```
+
+**CodeBot** (`ALLOWED_CALLERS` on gateway `/internal/test-skill`):
+```bash
+codebot  # Only codebot may call /internal/test-skill on the gateway
 ```
 
 ---

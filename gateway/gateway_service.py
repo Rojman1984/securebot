@@ -7,13 +7,15 @@ Author: SecureBot Project
 License: MIT
 """
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import hmac
 import httpx
 import os
+import subprocess
 import sys
+import tempfile
 from typing import Optional, Dict, Any, List
 import logging
 from datetime import datetime
@@ -45,8 +47,9 @@ _GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    """Reject requests missing a valid X-API-Key (except /health)."""
-    if request.url.path == "/health":
+    """Reject requests missing a valid X-API-Key (except /health and /internal/*)."""
+    # /health and internal endpoints use HMAC auth, not the external API key
+    if request.url.path == "/health" or request.url.path.startswith("/internal/"):
         return await call_next(request)
     if not _GATEWAY_API_KEY:
         logger.warning("GATEWAY_API_KEY not set — gateway is unprotected")
@@ -64,6 +67,17 @@ class Message(BaseModel):
     text: str
     metadata: Optional[Dict[str, Any]] = {}
     system: Optional[str] = None
+
+
+class TestSkillPayload(BaseModel):
+    """Payload for the internal skill test sandbox."""
+    code: str
+    execution_mode: str  # "bash" or "python"
+
+
+# Auth dependency for internal endpoints (HMAC, callers: codebot)
+from common.auth import create_auth_dependency
+_internal_auth = create_auth_dependency(["codebot"])
 
 
 class SearchDetector:
@@ -498,6 +512,62 @@ async def root() -> Dict[str, str]:
         "version": "2.0.0",
         "status": "running"
     }
+
+
+@app.post("/internal/test-skill")
+async def test_skill(
+    payload: TestSkillPayload,
+    request: Request,
+    _auth=Depends(_internal_auth),
+) -> Dict[str, Any]:
+    """
+    Internal-only sandbox for CodeBot to safely test generated scripts.
+    Accessible only from the securebot Docker bridge network.
+    Auth: HMAC-SHA256 signed by codebot service.
+
+    Executes code strictly via sudo -u securebot-scripts — same paradigm
+    as the existing bash skill execution in orchestrator.py.
+    """
+    execution_mode = payload.execution_mode.lower()
+    if execution_mode not in ("bash", "python"):
+        raise HTTPException(status_code=400, detail="execution_mode must be 'bash' or 'python'")
+
+    suffix = ".sh" if execution_mode == "bash" else ".py"
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=suffix, delete=False
+        ) as tmp:
+            tmp.write(payload.code)
+            tmp_path = tmp.name
+
+        os.chmod(tmp_path, 0o644)  # allow securebot-scripts to read
+
+        if execution_mode == "bash":
+            cmd = ["sudo", "-u", "securebot-scripts", "bash", tmp_path]
+        else:
+            cmd = ["sudo", "-u", "securebot-scripts", "python3", tmp_path]
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return {
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "exit_code": proc.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "Execution timed out (30s limit)", "exit_code": 124}
+    except Exception as e:
+        logger.error("test-skill execution error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

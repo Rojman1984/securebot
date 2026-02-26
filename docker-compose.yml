@@ -9,7 +9,7 @@ services:
       - VAULT_PASSWORD=${VAULT_PASSWORD:-change-me-in-production}
       - SERVICE_SECRET=${SERVICE_SECRET}
       - SERVICE_ID=vault
-      - ALLOWED_CALLERS=gateway,rag-service,memory-service,heartbeat
+      - ALLOWED_CALLERS=gateway,rag-service,memory-service,heartbeat,codebot
       - WEB_CONCURRENCY=1
     volumes:
       - ./vault/secrets:/vault
@@ -37,6 +37,7 @@ services:
       - RESPONSE_MODEL=${RESPONSE_MODEL:-llama3.2:3b-instruct-q4_K_M}
       - MEMORY_SERVICE_URL=http://memory-service:8300
       - RAG_URL=http://rag-service:8400
+      - CODEBOT_URL=http://codebot:8500
       - SERVICE_SECRET=${SERVICE_SECRET}
       - SERVICE_ID=gateway
       - ALLOWED_CALLERS=external
@@ -57,6 +58,7 @@ services:
       - vault
       - memory-service
       - rag-service
+      - codebot
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -66,6 +68,34 @@ services:
       timeout: 15s
       retries: 5
       start_period: 30s
+
+  codebot:
+    build:
+      context: .
+      dockerfile: codebot/Dockerfile
+    container_name: codebot
+    environment:
+      - GATEWAY_URL=http://gateway:8080
+      - SERVICE_SECRET=${SERVICE_SECRET}
+      - SERVICE_ID=codebot
+      - ALLOWED_CALLERS=gateway
+      - WEB_CONCURRENCY=1
+      - HF_HOME=/workspace/.cache/huggingface
+      - SKILLS_DIR=/workspace/skills
+    volumes:
+      - ./skills:/workspace/skills:rw
+      - ~/.cache/huggingface:/workspace/.cache/huggingface
+    networks:
+      - securebot
+    ports:
+      - "8500:8500"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8500/health')"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
 
   memory-service:
     build:

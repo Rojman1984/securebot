@@ -8,11 +8,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends sudo && \
     useradd -u 1000 -m appuser && \
     useradd -r -s /bin/bash -m securebot-scripts && \
     passwd -l securebot-scripts && \
-    echo "appuser ALL=(securebot-scripts) NOPASSWD: /bin/bash" > /etc/sudoers.d/securebot-scripts && \
+    echo "appuser ALL=(securebot-scripts) NOPASSWD: /bin/bash, /usr/local/bin/python3" > /etc/sudoers.d/securebot-scripts && \
     chmod 440 /etc/sudoers.d/securebot-scripts
 
 # Install PyTorch with CUDA 12.1 support before other deps
-RUN pip install torch --index-url https://download.pytorch.org/whl/cu121 --timeout 300
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu --timeout 300
 
 # Copy requirements
 COPY gateway/requirements.txt .

@@ -33,6 +33,7 @@ docker compose logs -f gateway
 | Vault   | 8200  | Secrets storage & multi-provider search |
 | Memory  | 8300  | Persistent user context                 |
 | RAG     | 8400  | ChromaDB vector embeddings              |
+| CodeBot | 8500  | Skill generation agent                  |
 | Ollama  | 11434 | Local LLM (on host, not Docker)         |
 
 Only the Gateway is exposed externally. All inter-service traffic is on the `securebot` Docker bridge network.
@@ -52,7 +53,9 @@ User Query
                         ↓
                     Match found?
                     ├── YES → Execute Bash/Ollama locally (Free)
-                    └── NO  → [3] Haiku API creates skill → Save → Execute (~$0.01)
+                    └── NO  → [3] CodeBot (Pi + Haiku) → Save → Execute (~$0.01)
+                                   ↓ (CodeBot unavailable?)
+                               [4] Haiku API direct (fallback only)
 ```
 
 **Key Principle:** Tool routing is deterministic. Memory retrieval is probabilistic. **These two pipelines must never merge.** RAG is consulted ONLY for knowledge and chat intents. Legacy LLM-based classifiers (`phi4-mini`) have been retired.
@@ -90,6 +93,7 @@ timeout: 5
 ## Inter-Service Authentication & Security
 
 * **HMAC-SHA256:** All requests between services use `X-Service-ID`, `X-Timestamp`, `X-Nonce`, `X-Signature`.
+* **Endpoint Protection:** `Depends(verify_service_request)` is wired to all protected endpoints in vault, memory, and rag via the `APIRouter` pattern. `/health` endpoints remain public for Docker healthchecks. All three services (vault :8200, memory :8300, rag :8400) return 401 on unsigned requests. `/internal/test-skill` on gateway accepts codebot service ID only.
 * **Bash Sandboxing:** The `gateway` container executes bash scripts using `sudo -u securebot-scripts` configured via host-side sudoers, preventing root container escapes.
 * **Anonymization Layer:** Before sending requests to Anthropic's Haiku API for skill creation, `orchestrator.py` runs `_sanitize_for_cloud`. This regex engine redacts emails, IPs, MAC addresses, SSH keys, and explicit keywords defined in the `.env` via `REDACT_WORDS`.
 
@@ -98,35 +102,16 @@ timeout: 5
 * `vault/secrets/secrets.json` — API keys. Injected by Vault at runtime. Never passed to AI models.
 * `.env` — Holds `GATEWAY_API_KEY`, `SERVICE_SECRET`, and `REDACT_WORDS` (for the anonymization layer).
 
-## Documentation Discrepancies To Correct.
-
-** **The Routing Logic is Outdated**
-
-- Currently in Docs: Both CLAUDE.md and ARCHITECTURE.md describe a pipeline using SearchDetector, a complex SkillMatcher scoring system (+5 for name, +3 fortrigger), and a ComplexityClassifier.
-
-- The Reality: These have been retired. The orchestrator now uses a Master Pre-Router. GLiClass evaluates the intent first (in <50ms), and if it's an action, the SkillRegistry does a deterministic trigger lookup. Pipeline A (Deterministic) and Pipeline B (RAG) are strictly separated.
-
-** **Bash Skill Execution is Missing**
-
-- Currently in Docs: Skills execute via Ollama or Claude Code.
-
-- The Reality: You implemented a highly secure bash execution mode. Skills are saved as .sh scripts to a temporary file and executed on the host OS via  sudo -u securebot-scripts, with the stdout captured and wrapped by llama3.2:3b.
-
-** **Pending Tasks are Complete**
-
-- Currently in Docs: CLAUDE.md lists the "Anonymized memory layer" as pending.
-
-- The Reality: _sanitize_for_cloud is fully implemented using Regex + explicit environment variables (REDACT_WORDS), successfully scrubbing user.md before sending it to the Haiku API.
-
 ## Do Not Touch
 
 - `vault/secrets/secrets.json` — never overwrite programmatically.
 - `memory/soul.md` — chmod 444, read-only identity file.
 - **Skills Collection:** Do not embed `SKILL.md` files into ChromaDB. Skills are loaded directly into RAM by the `SkillRegistry` object.
+- `codebot/tools/` — Pi CLI tool definitions. Modifying these breaks the CodeBot skill generation pipeline.
 
 ## Active Development Direction
 
-**Next phase:** Distributed specialist agent fleet — SearchBot, CodeBot, MemoryBot, ReasonBot as isolated containers. SecureBot orchestrates; specialists receive sanitized payloads only (need-to-know context isolation).
+**Current phase:** Sprint 2 — ReAct Watchdog + Cost Accounting. CodeBot (Foundations Sprint 1) is complete. Next specialists: SearchBot, MemoryBot, ReasonBot as isolated containers. SecureBot orchestrates; specialists receive sanitized payloads only (need-to-know context isolation).
 
 **Hardware:**
 Ryzen 5 8600G + GTX 1050 Ti · 16GB RAM · SecureBot-P2 · Mission, TX

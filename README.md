@@ -128,9 +128,11 @@ See [docs/HARDWARE.md](docs/HARDWARE.md) for detailed setup guides and benchmark
 │      ├── chat      → ChromaDB RAG context → Ollama (FREE)      │
 │      └── action    → [2] SkillRegistry (deterministic match)   │
 │                           ├── Match  → Execute locally (FREE)  │
-│                           └── No match → [3] Haiku creates     │
-│                                          skill → Execute (~$0.01│
-│                                          one-time)              │
+│                           └── No match → [3] CodeBot (:8500)   │
+│                                          Pi + Haiku → Save →   │
+│                                          Execute (~$0.01 once)  │
+│                                          (fallback: Haiku direct│
+│                                          if CodeBot unavailable)│
 └─────────────────────────────────────────────────────────────────┘
                           │
                           ▼
@@ -438,6 +440,11 @@ securebot/
 ├── vault/                # Secrets management
 │   ├── vault_service.py     # Secure API key injection
 │   └── secrets/             # secrets.json (gitignored)
+├── codebot/              # Skill generation specialist agent (:8500)
+│   ├── codebot_service.py   # FastAPI service
+│   ├── skill_router.py      # GLiClass coding intent classifier
+│   ├── pi_config.json       # Pi coding agent configuration
+│   └── tools/               # Pi CLI tools (lint, test, validate, commit)
 ├── skills/               # Reusable AI skills
 │   ├── search-google/
 │   ├── search-tavily/
@@ -458,9 +465,12 @@ securebot/
 
 ### Developed On
 
-- **Hardware:** Ryzen 5 3500U mini PC with 16GB RAM
-- **Model:** phi4-mini:3.8b and llama3:8b
-- **Performance:** 14-50 seconds per query (budget hardware proves it works!)
+- **Hardware:** Ryzen 5 8600G + GTX 1050 Ti · 16GB RAM (SecureBot-P2, McAllen TX)
+- **Holy Trinity of Models:**
+  - GLiClass `knowledgator/gliclass-small-v1.0` (144M params) — CPU in gateway container, intent routing <50ms
+  - `nomic-embed-text` (137M params) — via Ollama on host GPU, RAG embeddings
+  - `llama3.2:3b-instruct-q4_K_M` — via Ollama on host GPU, response generation
+- **Performance:** <50ms routing + 2-5 seconds generation on host GPU
 - **Assistance:** Built with Claude Code and Windsurf IDE
 
 ---
@@ -521,9 +531,11 @@ SecureBot implements **defense-in-depth security** with multiple layers:
 ### 🔒 Inter-Service Authentication
 
 - **HMAC-SHA256 Signed Requests** - All service-to-service communication is cryptographically signed
+- **Fully Implemented & Verified** - `Depends(verify_service_request)` wired to all protected endpoints in vault (:8200), memory (:8300), and rag (:8400) via APIRouter pattern. All three services return 401 on unsigned requests.
 - **Replay Attack Prevention** - 30-second timestamp window + nonce tracking
 - **Service Trust Matrix** - Each service explicitly defines who can call it
 - **Zero External Access** - External requests to internal services are rejected (401 Unauthorized)
+- **Health Endpoints Public** - `/health` on all services remains unauthenticated for Docker healthchecks
 
 ### 🔑 Secret Management
 

@@ -287,7 +287,65 @@ async def execute_skill(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Haiku Skill Generation
+# CodeBot Skill Generation — primary path (free, local Pi CLI)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def codebot_generate_skill(
+    user_request: str,
+    skills_dir: Path,
+) -> dict:
+    """
+    Forward a sanitized skill-generation request to the CodeBot container.
+    CodeBot uses Pi CLI to generate, lint, sandbox-test, and commit the skill.
+    Cost: $0.00 — no Anthropic API calls involved.
+
+    Falls back to haiku_generate_skill() if CodeBot is unavailable.
+    """
+    sanitized = _sanitize_for_cloud(user_request)
+    codebot_url = os.getenv("CODEBOT_URL", "http://codebot:8500")
+
+    service_id = os.getenv("SERVICE_ID", "gateway")
+    service_secret = os.getenv("SERVICE_SECRET", "")
+    signed_client = SignedClient(service_id, service_secret) if service_secret else None
+
+    logger.info("Forwarding skill generation to CodeBot: %s", sanitized[:80])
+
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            payload = {"intent": sanitized}
+            if signed_client:
+                resp = await signed_client.post(
+                    client, f"{codebot_url}/generate-skill", json=payload
+                )
+            else:
+                resp = await client.post(
+                    f"{codebot_url}/generate-skill", json=payload
+                )
+
+        if resp.status_code != 200:
+            raise Exception(f"CodeBot returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        if not data.get("success"):
+            raise Exception(f"CodeBot reported failure: {data.get('error', 'unknown')}")
+
+        logger.info(
+            "CodeBot committed skill: %s at %s (cost=$0.00)",
+            data.get("skill_name"), data.get("skill_path"),
+        )
+        return {
+            "success": True,
+            "skill_name": data["skill_name"],
+            "skill_path": data.get("skill_path", ""),
+            "cost": 0.0,
+        }
+    except Exception as e:
+        logger.warning("CodeBot unavailable: %s — falling back to Haiku", e)
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Haiku Skill Generation — fallback when CodeBot is unavailable
 # ─────────────────────────────────────────────────────────────────────────────
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
@@ -727,9 +785,15 @@ async def route_query(
                 "cost": 0.0, "engine": "ollama"
             }
         else:
-            logger.info("No skill match — escalating to Haiku")
+            logger.info("No skill match — escalating to CodeBot (Pi CLI)")
             skills_path = Path(SKILLS_DIR)
-            result = await haiku_generate_skill(query, vault_url, skills_path)
+            # Primary path: CodeBot (free, Pi CLI, no API cost)
+            # Fallback: Haiku (~$0.01, used only when CodeBot is unavailable)
+            try:
+                result = await codebot_generate_skill(query, skills_path)
+            except Exception:
+                logger.info("Haiku fallback activated for skill generation")
+                result = await haiku_generate_skill(query, vault_url, skills_path)
             if result["success"]:
                 skill_registry.reload()
                 new_skill = skill_registry.get(result["skill_name"])
