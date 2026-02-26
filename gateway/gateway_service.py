@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from typing import Optional, Dict, Any, List
 import logging
 from datetime import datetime
@@ -47,9 +48,14 @@ _GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    """Reject requests missing a valid X-API-Key (except /health and /internal/*)."""
-    # /health and internal endpoints use HMAC auth, not the external API key
-    if request.url.path == "/health" or request.url.path.startswith("/internal/"):
+    """Reject requests missing a valid X-API-Key (except /health, /internal/*, and /approvals/request|status)."""
+    # /health, internal endpoints, and HMAC-protected approval endpoints bypass API key check
+    if (
+        request.url.path == "/health"
+        or request.url.path.startswith("/internal/")
+        or request.url.path == "/approvals/request"
+        or request.url.path.startswith("/approvals/status/")
+    ):
         return await call_next(request)
     if not _GATEWAY_API_KEY:
         logger.warning("GATEWAY_API_KEY not set — gateway is unprotected")
@@ -78,6 +84,23 @@ class TestSkillPayload(BaseModel):
 # Auth dependency for internal endpoints (HMAC, callers: codebot)
 from common.auth import create_auth_dependency
 _internal_auth = create_auth_dependency(["codebot"])
+_codebot_auth = create_auth_dependency(["codebot"])
+
+# ── Approval Queue ─────────────────────────────────────────────────────────────
+# In-memory store: request_id → record dict.
+# Requests survive gateway restarts only via client resolution.
+_APPROVAL_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+class ApprovalRequest(BaseModel):
+    rationale: str
+    needs: str                          # key name or "approval" or "notification"
+    request_type: str = "credential"   # "credential" | "permission" | "notification"
+
+
+class ApprovalResolution(BaseModel):
+    resolution: str                    # resolved value (API key, "approved", etc.)
+    key_name: Optional[str] = None     # if set, route the value to Vault under this name
 
 
 class SearchDetector:
@@ -393,13 +416,17 @@ gateway = GatewayService()
 
 @app.on_event("startup")
 async def startup_event():
-    """Load GLiClass classifier and seed classifier examples on startup"""
+    """Load GLiClass classifier, start ReAct Watchdog, and seed classifier examples on startup."""
     import asyncio
     from orchestrator import seed_classifier_examples_on_startup
     from gliclass_classifier import load_classifier
+    from watchdog_service import start_watchdog
 
     # Load GLiClass into GPU memory — must complete before first request
     load_classifier(device="cuda:0")
+
+    # Start ReAct Watchdog in background daemon thread
+    start_watchdog()
 
     # Run seeding in background (non-blocking)
     asyncio.create_task(
@@ -568,6 +595,94 @@ async def test_skill(
             os.unlink(tmp_path)
         except Exception:
             pass
+
+
+@app.post("/approvals/request")
+async def create_approval_request(
+    payload: ApprovalRequest,
+    _auth=Depends(_codebot_auth),
+) -> Dict[str, Any]:
+    """
+    CodeBot (or any HMAC-authenticated service) posts an approval request.
+    Returns the request ID immediately; the request stays pending until resolved.
+    """
+    req_id = uuid.uuid4().hex[:8]
+    _APPROVAL_STORE[req_id] = {
+        "id": req_id,
+        "rationale": payload.rationale,
+        "needs": payload.needs,
+        "request_type": payload.request_type,
+        "status": "pending",
+        "resolution": None,
+        "created_at": datetime.now().isoformat(),
+        "resolved_at": None,
+    }
+    logger.info("Approval request %s created: %s", req_id, payload.rationale[:80])
+    return {"id": req_id, "status": "pending"}
+
+
+@app.get("/approvals/pending")
+async def get_pending_approvals() -> Dict[str, Any]:
+    """Return all unresolved approval requests (API-key protected, for CLI use)."""
+    pending = [v for v in _APPROVAL_STORE.values() if v["status"] == "pending"]
+    return {"requests": pending, "count": len(pending)}
+
+
+@app.post("/approvals/resolve/{request_id}")
+async def resolve_approval(
+    request_id: str,
+    payload: ApprovalResolution,
+) -> Dict[str, Any]:
+    """
+    Resolve a pending approval request (API-key protected, for CLI use).
+    If key_name is provided, the resolution value is stored in Vault under that name.
+    """
+    if request_id not in _APPROVAL_STORE:
+        raise HTTPException(status_code=404, detail="Approval request not found")
+    record = _APPROVAL_STORE[request_id]
+    if record["status"] != "pending":
+        raise HTTPException(status_code=409, detail="Request already resolved")
+
+    # Route to Vault if a key name was specified
+    if payload.key_name and gateway.signed_client:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await gateway.signed_client.post(
+                    client,
+                    f"{gateway.vault_url}/secret",
+                    json={"key": payload.key_name, "value": payload.resolution},
+                )
+            if resp.status_code not in (200, 201):
+                raise RuntimeError(f"Vault returned HTTP {resp.status_code}")
+            logger.info("Key '%s' stored in Vault via approval %s", payload.key_name, request_id)
+        except Exception as e:
+            logger.error("Failed to store key in Vault: %s", e)
+            raise HTTPException(status_code=502, detail=f"Vault storage failed: {e}")
+
+    record["status"] = "resolved"
+    record["resolution"] = payload.resolution
+    record["resolved_at"] = datetime.now().isoformat()
+    logger.info("Approval %s resolved (type=%s)", request_id, record["request_type"])
+    return {"id": request_id, "status": "resolved"}
+
+
+@app.get("/approvals/status/{request_id}")
+async def get_approval_status(
+    request_id: str,
+    _auth=Depends(_codebot_auth),
+) -> Dict[str, Any]:
+    """
+    HMAC-protected status poll endpoint for CodeBot to check if its request was resolved.
+    Returns resolution value only when status == "resolved".
+    """
+    if request_id not in _APPROVAL_STORE:
+        raise HTTPException(status_code=404, detail="Approval request not found")
+    record = _APPROVAL_STORE[request_id]
+    return {
+        "id": request_id,
+        "status": record["status"],
+        "resolution": record.get("resolution") if record["status"] == "resolved" else None,
+    }
 
 
 if __name__ == "__main__":

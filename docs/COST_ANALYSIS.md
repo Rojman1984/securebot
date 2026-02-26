@@ -120,11 +120,16 @@ SecureBot achieves 95-97% cost savings compared to commercial AI services throug
 |-----------|--------------|---------------|--------------|--------------|
 | Simple Query | 500 | 500 | (500 × $0.003 + 500 × $0.015)/1M | $0.009 |
 | Complex Query | 2000 | 2000 | (2000 × $0.003 + 2000 × $0.015)/1M | $0.036 |
-| Skill Creation | 5000 | 5000 | (5000 × $0.003 + 5000 × $0.015)/1M | $0.09 |
+| Skill Creation | 5000 | 5000 | (5000 × $1.00 + 5000 × $5.00)/1M | $0.03 |
 
 **Claude API Pricing (Opus 4.6):**
 - Input: $0.003/1K tokens
 - Output: $0.015/1K tokens
+
+**Haiku 4.5 rates (used for skill creation):**
+- Input: $1.00/M tokens
+- Output: $5.00/M tokens
+- Skill creation (~5K in + 5K out tokens): ~$0.03 per skill
 
 ---
 
@@ -608,6 +613,19 @@ docker-compose up -d
 **SecureBot is not just cheaper - it's an order of magnitude cheaper.** After a brief payback period, you effectively get unlimited AI assistance at near-zero cost.
 
 **The secret:** Create reusable skills with Claude API ($0.10 each), then execute them infinitely with free local models. This hybrid approach captures the best of both worlds - Claude's intelligence for skill creation, local models for zero-cost execution.
+
+---
+
+### Cost Monitoring
+
+SecureBot automatically tracks all Haiku API usage in `/memory/cost_logs.json`. View aggregated cost reports using the built-in skill:
+
+Trigger phrases:
+- "show me my api costs"
+- "cost report"
+- "how much have i spent"
+
+The report aggregates by day and session, showing model used, token counts, and running totals. Local Ollama usage is always $0.00 and is not logged.
 
 ---
 

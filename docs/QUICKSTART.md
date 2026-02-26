@@ -22,7 +22,7 @@ curl http://localhost:11434/api/tags
 
 ```bash
 # Budget hardware (8GB RAM)
-ollama pull phi4-mini:3.8b
+ollama pull llama3.2:3b
 
 # OR Mid-range (16GB RAM)
 ollama pull llama3:8b
@@ -100,6 +100,12 @@ curl http://localhost:11434/api/tags  # Ollama
 
 # Docker status
 docker compose ps
+
+# Watchdog job health
+cat memory/jobs_status.json | python3 -m json.tool
+
+# API cost log
+cat memory/cost_logs.json | python3 -m json.tool
 ```
 
 ### View Logs
@@ -148,6 +154,44 @@ curl http://localhost:8300/memory/context
 # Get tasks
 curl http://localhost:8300/tasks
 ```
+
+### System Dashboard (/jobs)
+
+The TUI includes a live System Dashboard. Type `/jobs` in the chat input to toggle it.
+
+**Dashboard shows:**
+- All scheduled background jobs with health status and last-check timestamp
+- Watchdog ReAct diagnosis for any failed units
+- Pending CodeBot approval requests (credential requests, permission requests)
+
+**Resolving an approval request:**
+1. Type `/jobs` to open the dashboard
+2. Note the index number of the pending request (e.g., `0`)
+3. Type: `0 <value>`  (e.g., `0 sk_live_abc123`)
+4. Press Enter — credential-type resolutions are routed through Vault automatically
+5. Ctrl-C or `/jobs` to return to chat
+
+**Alert in chat view:**
+When approvals are pending, the header bar shows: `[!N APPROVALS /jobs]`
+The dashboard polls every 10 seconds automatically.
+
+**Via API (non-TUI):**
+```bash
+# Check pending approvals
+curl http://localhost:8080/approvals/pending \
+  -H "X-API-Key: <GATEWAY_API_KEY>"
+
+# Resolve an approval
+curl -X POST http://localhost:8080/approvals/resolve/<id> \
+  -H "X-API-Key: <GATEWAY_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "sk_live_...", "key_name": "stripe_api_key"}'
+```
+
+> ⚠️ The approval store is in-memory. Pending approvals are lost if the
+> gateway container restarts. If CodeBot is blocked waiting for approval
+> and the gateway restarts, CodeBot will time out (5 min) and the skill
+> generation will fail. Re-trigger the original query to start again.
 
 ### Check System Automation (if installed)
 
@@ -210,6 +254,15 @@ curl -X POST http://localhost:8080/message \
     "user_id": "user1",
     "text": "How do I schedule a backup script to run daily at 2am using cron?"
   }'
+```
+
+### Cost Report (Free - Python skill)
+
+```bash
+curl -X POST http://localhost:8080/message \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <GATEWAY_API_KEY>" \
+  -d '{"channel":"api","user_id":"user1","text":"show me my api costs"}'
 ```
 
 ## Troubleshooting
@@ -308,7 +361,8 @@ tail -f memory/daily.log
 - Ollama queries = FREE
 - Search queries = FREE (within tier limits)
 - Skill execution = FREE
-- Skill creation = ~$0.10 (one-time)
+- Skill creation = ~$0.01 (CodeBot local path, no API cost)
+- Skill creation via Haiku fallback = ~$0.01 (if CodeBot unavailable) (one-time)
 - Complex Claude queries = ~$0.006
 
 Most queries should be FREE!

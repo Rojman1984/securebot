@@ -66,6 +66,13 @@ SecureBot's memory system provides persistent context, continuity across session
 - completed[] array for finished tasks
 - Task metadata (ID, title, description, priority, timestamps)
 
+### Runtime Data Files
+
+| File | Purpose | Permissions |
+|------|---------|-------------|
+| `jobs_status.json` | Watchdog job health + ReAct diagnoses (written by watchdog daemon) | Read/write |
+| `cost_logs.json` | Haiku API cost audit trail (append-only, written by orchestrator) | Read/write |
+
 ## System-Native Automation Philosophy
 
 ### The Golden Rule: Use System Tools First
@@ -243,7 +250,7 @@ else:
     final_prompt = user_query
 
 # Send to Ollama
-result = ollama.generate(model="phi4-mini:3.8b", prompt=final_prompt)
+result = ollama.generate(model="llama3.2:3b", prompt=final_prompt)
 ```
 
 #### RAG Architecture
@@ -269,7 +276,7 @@ Memory changes trigger automatic re-embedding:
 #### Session Summarization
 
 At end of each day (systemd daily timer):
-1. phi4-mini summarizes session.md to 200 tokens
+1. llama3.2:3b summarizes session.md to 200 tokens
 2. Summary saved to `memory/summaries/session_YYYY-MM-DD.md`
 3. session.md updated with summary
 4. Memory automatically re-embedded
@@ -517,7 +524,7 @@ curl http://localhost:8200/health
                          ▼
               ┌──────────────────────┐
               │  Ollama              │  Local LLM
-              │  (phi4-mini:3.8b)    │  With relevant context
+              │  (llama3.2:3b)    │  With relevant context
               └──────────────────────┘  (300 tokens max)
 
 ┌─────────────────────────────────────────────────────────────┐

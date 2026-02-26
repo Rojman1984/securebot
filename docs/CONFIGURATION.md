@@ -178,10 +178,11 @@ orchestrator:
   skill_creation: normal
 
   # Default model for Ollama
-  ollama_model: "phi4-mini:3.8b"
+  ollama_model: "llama3.2:3b"
 
   # Default Claude model for skill creation
-  claude_model: "claude-sonnet-4-20250514"
+  # Used only as fallback when CodeBot (:8500) is unavailable
+  claude_model: "claude-haiku-4-5-20251001"
 ```
 
 ---
@@ -208,7 +209,7 @@ environment:
 environment:
   - VAULT_URL=http://vault:8200
   - OLLAMA_HOST=http://host.docker.internal:11434
-  - OLLAMA_MODEL=phi4-mini:3.8b
+  - OLLAMA_MODEL=llama3.2:3b
 ```
 
 #### `VAULT_URL`
@@ -223,11 +224,11 @@ environment:
 - **Modify**: If Ollama runs on different host/port
 
 #### `OLLAMA_MODEL`
-- **Default**: `phi4-mini:3.8b`
+- **Default**: `llama3.2:3b`
 - **Purpose**: Default Ollama model for simple queries and skill execution
 - **Options**: Any model installed in Ollama (`ollama list`)
 - **Recommendations**:
-  - `phi4-mini:3.8b` - Fast, low memory (3.8GB)
+  - `llama3.2:3b` - Fast, low memory (3.8GB)
   - `phi4:14b` - Better quality, more memory (14GB)
   - `llama3.2:8b` - Balanced performance
   - `qwen2.5:14b` - High quality
@@ -434,7 +435,7 @@ gateway:
 
 ```yaml
 orchestrator:
-  ollama_model: "phi4-mini:3.8b"
+  ollama_model: "llama3.2:3b"
 ```
 
 **Purpose**: Model used for:
@@ -451,7 +452,7 @@ orchestrator:
 
 | Model | RAM | Speed | Quality | Best For |
 |-------|-----|-------|---------|----------|
-| `phi4-mini:3.8b` | 4GB | Fast | Good | Default, skill execution |
+| `llama3.2:3b` | 4GB | Fast | Good | Default, skill execution |
 | `phi4:14b` | 16GB | Medium | Better | Higher quality responses |
 | `llama3.2:8b` | 8GB | Medium | Good | Balanced |
 | `qwen2.5:14b` | 16GB | Medium | Great | Best quality |
@@ -461,19 +462,18 @@ orchestrator:
 
 ```yaml
 orchestrator:
-  claude_model: "claude-sonnet-4-20250514"
+  claude_model: "claude-haiku-4-5-20251001"  # Used only as fallback when CodeBot (:8500) is unavailable
 ```
 
 **Purpose**: Model used for:
-- Skill creation (complex tasks)
-- Direct Claude calls (complex one-off queries)
+- Skill creation fallback (when CodeBot :8500 is unavailable)
 
 **Cost Impact**: Every call costs money
 
 **Available Models**:
-- `claude-sonnet-4-20250514` - Balanced (default)
+- `claude-haiku-4-5-20251001` - Fast, cost-efficient (default fallback)
+- `claude-sonnet-4-20250514` - Higher quality (more expensive)
 - `claude-opus-4-20250514` - Highest quality (expensive)
-- `claude-3-5-sonnet-20241022` - Previous generation
 
 ---
 
@@ -722,7 +722,7 @@ gateway:
 
 orchestrator:
   skill_creation: conservative  # Create fewer skills (less Claude API usage)
-  ollama_model: "phi4-mini:3.8b"  # Fastest, lowest resource
+  ollama_model: "llama3.2:3b"  # Fastest, lowest resource
 
 vault:
   rate_limits:
@@ -767,8 +767,8 @@ DEFAULT_CONFIG = {
     },
     "orchestrator": {
         "skill_creation": "normal",
-        "ollama_model": "phi4-mini:3.8b",
-        "claude_model": "claude-sonnet-4-20250514"
+        "ollama_model": "llama3.2:3b",
+        "claude_model": "claude-haiku-4-5-20251001"  # fallback only, when CodeBot unavailable
     }
 }
 ```
@@ -878,7 +878,7 @@ docker-compose restart
 ### For Speed
 ```yaml
 orchestrator:
-  ollama_model: "phi4-mini:3.8b"  # Fastest
+  ollama_model: "llama3.2:3b"  # Fastest
 gateway:
   max_search_results: 2  # Fewer results
 ```

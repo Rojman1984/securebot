@@ -65,10 +65,12 @@ User Query
 - `gateway/orchestrator.py` — The core routing pipeline. Contains the master pre-router, strict pipeline separation, and `_sanitize_for_cloud` privacy layer.
 - `gateway/gliclass_classifier.py` — Zero-shot intent classifier. Loaded once into GPU/RAM at startup.
 - `gateway/gateway_service.py` — FastAPI endpoints.
+- `gateway/watchdog_service.py` — ReAct daemon — polls systemctl for failed units, fetches journalctl logs, diagnoses via llama3.2:3b, writes /memory/jobs_status.json.
 - `vault/vault_service.py` — Secret isolation + SearchOrchestrator with provider fallback.
 - `services/memory/memory_service.py` — Manages `soul.md`, `user.md`, `session.md`, `tasks.json`.
 - `services/rag/rag_service.py` — ChromaDB integration.
-- `securebot-cli.py` — Curses TUI. Connects to `127.0.0.1` explicitly.
+- `securebot-cli.py` — Curses TUI. Connects to `127.0.0.1` explicitly. Type `/jobs` to toggle the System Dashboard (job health, watchdog diagnoses, pending approval queue with inline resolve input).
+- `codebot/tools/tool_request_approval.py` — HMAC-signed HITL tool — POSTs to `/approvals/request`, polls `/approvals/status/{id}` every 5s up to 5min.
 
 ## Skills System
 
@@ -89,11 +91,20 @@ timeout: 5
 * **Matching:** Exact substring match based on `triggers` array in the frontmatter. (The legacy +5/+3 scoring system is retired).
 * **Execution (Bash):** Scripts are written to a temp file and executed via `subprocess.run` on the host OS as a locked-down user (`sudo -u securebot-scripts`). The `stdout` is then passed to Ollama to be wrapped in natural language.
 * **Execution (Ollama):** Pure prompt manipulation using `$ARGUMENTS`.
+* **Execution (Python):** Script block extracted from SKILL.md, written to temp file, executed via `sudo -u securebot-scripts python3`. stdout captured and returned directly (no Ollama wrap). Used for structured data tasks like cost reporting.
 
 ## Inter-Service Authentication & Security
 
 * **HMAC-SHA256:** All requests between services use `X-Service-ID`, `X-Timestamp`, `X-Nonce`, `X-Signature`.
 * **Endpoint Protection:** `Depends(verify_service_request)` is wired to all protected endpoints in vault, memory, and rag via the `APIRouter` pattern. `/health` endpoints remain public for Docker healthchecks. All three services (vault :8200, memory :8300, rag :8400) return 401 on unsigned requests. `/internal/test-skill` on gateway accepts codebot service ID only.
+* **Approval Queue Endpoints (gateway :8080):**
+
+  | Endpoint | Auth |
+  |----------|------|
+  | `POST /approvals/request` | HMAC-SHA256 (codebot only) |
+  | `GET  /approvals/pending` | API key (X-API-Key) |
+  | `POST /approvals/resolve/{id}` | API key (X-API-Key) |
+  | `GET  /approvals/status/{id}` | HMAC-SHA256 (codebot only) |
 * **Bash Sandboxing:** The `gateway` container executes bash scripts using `sudo -u securebot-scripts` configured via host-side sudoers, preventing root container escapes.
 * **Anonymization Layer:** Before sending requests to Anthropic's Haiku API for skill creation, `orchestrator.py` runs `_sanitize_for_cloud`. This regex engine redacts emails, IPs, MAC addresses, SSH keys, and explicit keywords defined in the `.env` via `REDACT_WORDS`.
 
@@ -111,7 +122,7 @@ timeout: 5
 
 ## Active Development Direction
 
-**Current phase:** Sprint 2 — ReAct Watchdog + Cost Accounting. CodeBot (Foundations Sprint 1) is complete. Next specialists: SearchBot, MemoryBot, ReasonBot as isolated containers. SecureBot orchestrates; specialists receive sanitized payloads only (need-to-know context isolation).
+**Current phase:** Sprint 3 complete. All three sprints delivered. Next phase: Specialist Agent Fleet (SearchBot, MemoryBot, ReasonBot as isolated containers). SecureBot orchestrates; specialists receive sanitized payloads only (need-to-know context isolation).
 
 **Hardware:**
 Ryzen 5 8600G + GTX 1050 Ti · 16GB RAM · SecureBot-P2 · Mission, TX

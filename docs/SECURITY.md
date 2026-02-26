@@ -22,6 +22,10 @@ SecureBot implements defense-in-depth security with multiple layers:
 | rag (8400) | `/embed/*`, `/classify/*`, `/context` | HMAC-SHA256 | `/health` |
 | gateway (8080) | `/message` | API key (X-API-Key) | `/health` |
 | gateway (8080) | `/internal/test-skill` | HMAC-SHA256 (codebot only) | — |
+| gateway (8080) | `POST /approvals/request` | HMAC-SHA256 (codebot only) | — |
+| gateway (8080) | `GET /approvals/pending` | API key (X-API-Key) | — |
+| gateway (8080) | `POST /approvals/resolve/{id}` | API key (X-API-Key) | — |
+| gateway (8080) | `GET /approvals/status/{id}` | HMAC-SHA256 (codebot only) | — |
 
 All three internal services (vault, memory, rag) return **401 Unauthorized** on unsigned requests. `/health` endpoints on all services remain public for Docker healthchecks.
 
@@ -84,7 +88,7 @@ All rejections are logged with:
 | **vault** | (none - receives only) | All services (vault doesn't make outbound calls) |
 | **memory-service** | rag-service | vault, gateway, codebot |
 | **rag-service** | memory-service | vault, gateway, codebot |
-| **codebot** | gateway (/internal/test-skill only) | vault, memory-service, rag-service |
+| **codebot** | gateway (/internal/test-skill, /approvals/request, /approvals/status/{id}) | vault, memory-service, rag-service |
 | **heartbeat** | gateway, memory-service, rag-service | vault, codebot |
 | **EXTERNAL** | (none) | ALL - external requests are rejected |
 
@@ -115,6 +119,24 @@ gateway,memory-service,heartbeat
 ```bash
 codebot  # Only codebot may call /internal/test-skill on the gateway
 ```
+
+> **Approval secret routing:** When a resolution includes a `key_name`, the gateway
+> routes the secret value through the Vault `/secret` endpoint. Secrets are never
+> stored in the approval queue itself and never written to secrets.json via this path.
+
+---
+
+## Approval Queue Security
+
+### Approval Queue
+
+The in-memory approval store (`_APPROVAL_STORE`) has these security properties:
+- Requests created only by HMAC-authenticated codebot service
+- Resolved only by API-key-authenticated CLI operator
+- Resolution values containing secrets are forwarded to Vault, not stored in the queue
+- **Important:** Store is in-memory only — pending approvals are lost on gateway restart
+- Resolved status and values are available to codebot polling via HMAC-authenticated
+  `/approvals/status/{id}` only after resolution
 
 ---
 

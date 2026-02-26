@@ -7,7 +7,7 @@ SecureBot uses a RAG system to solve the **context window problem** on budget ha
 **Problem**: Prepending full memory files (soul.md, user.md, session.md) to every prompt caused:
 - httpx.ReadTimeout (120+ seconds on Ryzen 5 3500U)
 - Wasted context window on irrelevant memory
-- Poor performance with phi4-mini:3.8b
+- Poor performance with llama3.2:3b
 
 **Solution**: RAG with ChromaDB
 - Embed memory chunks into vector database
@@ -191,7 +191,7 @@ Response:
 
 ### POST /summarize/session
 Summarize current session.md to 200 tokens
-- Uses phi4-mini to summarize
+- Uses llama3.2:3b to summarize
 - Saves to `memory/summaries/session_2025-01-15.md`
 - Updates session.md with summary
 - Re-embeds memory automatically

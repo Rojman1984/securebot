@@ -38,6 +38,7 @@ SecureBot uses a **hybrid architecture** combining local and cloud inference for
 │                    PRESENTATION LAYER                           │
 │  • REST API endpoints (Gateway port 8080)                       │
 │  • TUI CLI (securebot-cli.py)                                   │
+│  • /jobs dashboard (job health, watchdog diagnoses, approval queue) │
 │  • Request validation, API key enforcement                      │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
@@ -50,10 +51,10 @@ SecureBot uses a **hybrid architecture** combining local and cloud inference for
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
 │                     EXECUTION LAYER                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
-│  │    Ollama    │  │  Haiku API   │  │  Bash Runner │         │
-│  │ (Local/Free) │  │ (Skill gen)  │  │  (Sandboxed) │         │
-│  └──────────────┘  └──────────────┘  └──────────────┘         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │    Ollama    │  │   CodeBot    │  │  Haiku API   │  │  Bash Runner │  │
+│  │ (Local/Free) │  │ (Port 8500)  │  │ (Fallback)   │  │  (Sandboxed) │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
@@ -62,6 +63,8 @@ SecureBot uses a **hybrid architecture** combining local and cloud inference for
 │  • Vault secrets (secrets.json, volume-mounted)                 │
 │  • Memory service (soul.md, user.md, session.md, tasks.json)    │
 │  • RAG / ChromaDB (knowledge + chat context only)               │
+│  • /memory/jobs_status.json  (watchdog job health + ReAct diagnoses) │
+│  • /memory/cost_logs.json    (Haiku API cost audit trail)       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,11 +93,34 @@ SecureBot uses a **hybrid architecture** combining local and cloud inference for
 
 **Endpoints:**
 ```
-POST /message          → Send message to SecureBot
-GET  /health           → Health check (all 5 services)
-GET  /skills           → List loaded skills
-POST /skills/reload    → Hot-reload SkillRegistry from disk
+POST /message               → Send message to SecureBot
+GET  /health                → Health check (all 5 services)
+GET  /skills                → List loaded skills
+POST /skills/reload         → Hot-reload SkillRegistry from disk
+POST /approvals/request     → CodeBot HITL credential/permission request
+GET  /approvals/pending     → CLI polls unresolved requests
+POST /approvals/resolve/{id} → CLI operator submits resolution (secrets via Vault)
+GET  /approvals/status/{id}  → CodeBot polls for resolution
 ```
+
+---
+
+### 1b. Watchdog Service (Background Daemon)
+
+**Purpose:** The watchdog daemon runs as a background thread inside the gateway container. No external port. The watchdog passively monitors host systemd units and uses local LLM inference to diagnose failures.
+
+**Responsibilities:**
+- The watchdog polls `systemctl list-timers --all` via `sudo -u securebot-scripts` (sandboxed)
+- Detect failed systemd units
+- Fetch `journalctl` logs for failed units (sandboxed)
+- Send ReAct-structured prompt to `llama3.2:3b` for root-cause diagnosis
+- Write watchdog job health + diagnoses to `/memory/jobs_status.json`
+
+**Constraints:**
+- Model hardcoded to `llama3.2:3b` — no cloud API calls from watchdog
+- Requires host's `/run/systemd/private` and `/var/run/dbus/system_bus_socket` mounted to function; watchdog degrades gracefully without them
+
+**Key File:** `gateway/watchdog_service.py`
 
 ---
 
@@ -119,7 +145,7 @@ The `determine_routing_path()` function calls `classify_intent()` from `gliclass
 **Retired components (do not reference):**
 - `ComplexityClassifier` — removed
 - `SkillMatcher` scoring algorithm (+5 name, +3 trigger, +0.5 description) — removed
-- `phi4-mini` as classifier — removed
+- Legacy LLM-based intent classifier — removed (replaced by GLiClass)
 - `SearchDetector` keyword heuristics — removed (search is now a GLiClass intent)
 
 #### 2.2 SkillRegistry (Deterministic)
@@ -168,6 +194,24 @@ User Query
 - `knowledge` / `chat` → `_get_rag_context()` → ChromaDB retrieval → Ollama with context
 
 RAG is **never** consulted for search, task, or action intents.
+
+#### 2.4 Cost Accounting
+
+After every successful Haiku API call (skill creation fallback), `_append_cost_log()` appends a JSON entry to `/memory/cost_logs.json`:
+
+```json
+{
+  "timestamp": "ISO-8601",
+  "session_id": "string",
+  "task_name": "string",
+  "model": "claude-haiku-4-5-20251001",
+  "input_tokens": 0,
+  "output_tokens": 0,
+  "total_cost": 0.00
+}
+```
+
+**Haiku 4.5 rates:** $1.00/M input tokens, $5.00/M output tokens
 
 ---
 
@@ -277,14 +321,14 @@ User: "check if port 443 is open"
     ↓ Gateway validates API key
     ↓ GLiClass → intent: "action"
     ↓ SkillRegistry → no match
-    ↓ haiku_generate_skill():
-        1. _sanitize_for_cloud(user_request)
-        2. Load user.md → _sanitize_for_cloud(profile) → sanitized_profile
-        3. POST Anthropic Haiku API with enhanced_prompt (request + sanitized context)
-        4. Validate skill name regex, path traversal check
-        5. Save SKILL.md → skill_registry.reload()
+    ↓ codebot_generate_skill():
+        1. _sanitize_for_cloud(user_request + user profile)
+        2. POST to CodeBot :8500 (Pi CLI + GLiClass gatekeeper)
+        3. Pi workflow: classify → draft → lint → sandbox test → validate → commit
+        4. Sandbox runs via gateway /internal/test-skill as securebot-scripts
+        5. If CodeBot unavailable → fallback to haiku_generate_skill()
     ↓ execute_skill() new skill → bash → Ollama wrap
-    → Response  (cost: ~$0.01 one-time, engine: claude+ollama, method: skill_execution)
+    → Response  (cost: ~$0.01 one-time, engine: codebot+ollama, method: skill_execution)
 ```
 
 ### Flow 4: Knowledge / Chat Query
@@ -307,6 +351,23 @@ User: "what are my pending tasks?"
     ↓ Pipeline A: _get_tasks_from_memory() → memory:8300/tasks
     ↓ _format_tasks() → Ollama summary (FREE)
     → Response  (cost: $0.00, engine: ollama, method: task_lookup)
+```
+
+### Flow 6: CodeBot Needs a Secret (HITL Approval)
+
+```
+CodeBot: "I need a Stripe API key to generate this skill"
+    ↓ tool_request_approval.py
+    ↓ HMAC-signed POST /approvals/request {rationale, needs, type: "credential"}
+    ↓ Gateway stores in _APPROVAL_STORE (in-memory)
+    ↓ CLI header shows: [!1 APPROVALS /jobs]
+    ↓ Operator types /jobs → dashboard shows pending request
+    ↓ Operator types: 0 sk_live_...
+    ↓ Gateway routes secret through Vault /secret endpoint
+    ↓ POST /approvals/resolve/{id} → status: resolved
+    ↓ CodeBot poll (every 5s) detects resolved → reads resolution value
+    ↓ Pi CLI resumes workflow with provided secret
+    Cost: $0.00 (no additional API calls)
 ```
 
 ---
@@ -345,10 +406,11 @@ User: "what are my pending tasks?"
           │       │  Match      No match
           │       │    │          │
           │       │    ↓          ↓
-          │       │ Execute   [3] Haiku API
+          │       │ Execute   [3] CodeBot (:8500)
           │       │ Bash/     generates skill
-          │       │ Ollama    → Save → Execute
-          │       │  ($0)     (~$0.01 one-time)
+          │       │ Ollama         ↓ (unavailable?)
+          │       │  ($0)     ├── NO  → Pi workflow → validate → commit → Execute
+          │       │           └── YES → Haiku API fallback → Save → Execute
           │       │
           ↓       ↓
      [Pipeline A — No RAG]
@@ -408,6 +470,13 @@ Describe expected output.
 2. Sanitize user input (strip injection delimiters, truncate to 2000 chars)
 3. Replace `$ARGUMENTS` with bracketed user input: `[USER INPUT START]...[USER INPUT END]`
 4. POST to Ollama `/api/generate`
+
+**Python mode:**
+1. Extract ` ```python ` code block from SKILL.md
+2. Write to `tempfile.NamedTemporaryFile(suffix='.py')`; `chmod 644`
+3. `subprocess.run(['sudo', '-u', 'securebot-scripts', 'python3', script_path], ...)`
+4. Capture `stdout`; delete temp file
+5. Return stdout directly — no Ollama wrap (used for structured data output)
 
 ### Skill Lifecycle
 
@@ -481,8 +550,11 @@ subprocess.run(
 
 **Setup:** Host-side sudoers rule required:
 ```
-tasker0 ALL=(securebot-scripts) NOPASSWD: /bin/bash
+tasker0 ALL=(securebot-scripts) NOPASSWD: /bin/bash, /usr/local/bin/python3
 ```
+
+Note: Python path must match the actual binary location in the gateway container.
+Verify with: `docker exec securebot-gateway-1 which python3`
 
 **Script lifecycle:** Written to `tempfile`, `chmod 644` (so `securebot-scripts` can read), executed, then immediately deleted with `os.unlink()`.
 

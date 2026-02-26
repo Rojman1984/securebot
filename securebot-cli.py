@@ -34,6 +34,7 @@ RESPONSE_MODEL        = os.getenv("RESPONSE_MODEL", "llama3.2:3b")  # overridden
 REFRESH_INTERVAL      = 3
 MAX_CHAT_LINES        = 100
 SYSTEM_PROMPT_REFRESH = 30
+APPROVAL_POLL_INTERVAL = 10   # seconds between approval / jobs polling
 
 DRAW_LOG = "/tmp/securebot-draw.log"
 
@@ -460,6 +461,12 @@ class SecureBotApp:
         self.cursor_pos = 0
         self.scroll_offset = 0
 
+        # ── Dashboard / approval state ─────────────────────────────────────
+        self._view              = "chat"          # "chat" or "dashboard"
+        self._pending_approvals: list = []        # list of approval dicts from gateway
+        self._jobs_status: dict       = {}        # parsed jobs_status.json
+        self._approval_lock           = threading.Lock()
+
         self.monitor   = ResourceMonitor(self._redraw_needed)
         self.sp_builder = SystemPromptBuilder(self.prefs)
 
@@ -497,6 +504,9 @@ class SecureBotApp:
         # Startup in daemon thread
         t = threading.Thread(target=self._startup, daemon=True)
         t.start()
+
+        # Background approval/jobs poller
+        threading.Thread(target=self._approval_poll_loop, daemon=True).start()
 
         self.stdscr.nodelay(True)
         while self._running:
@@ -589,8 +599,117 @@ class SecureBotApp:
         self.chat.add("Ready.", curses.color_pair(C_DIM))
         self._redraw_needed.set()
 
+    # ── Background approval / jobs poller ─────────────────────────────────────
+    def _approval_poll_loop(self):
+        """Daemon thread: polls /approvals/pending and reads jobs_status.json every 10s."""
+        while self._running:
+            # Poll pending approvals from gateway
+            try:
+                url = f"{GATEWAY_URL}/approvals/pending"
+                gw_headers = {}
+                if GATEWAY_API_KEY:
+                    gw_headers["X-API-Key"] = GATEWAY_API_KEY
+                data = http_get(url, headers=gw_headers, timeout=5)
+                pending = data.get("requests", [])
+            except Exception:
+                pending = []
+
+            # Read jobs_status.json from memory dir
+            jobs = {}
+            try:
+                jobs_path = os.path.join(MEMORY_DIR, "jobs_status.json")
+                with open(jobs_path) as f:
+                    jobs = json.load(f)
+            except Exception:
+                pass
+
+            with self._approval_lock:
+                self._pending_approvals = pending
+                self._jobs_status = jobs
+
+            self._redraw_needed.set()
+            time.sleep(APPROVAL_POLL_INTERVAL)
+
+    def _handle_dashboard_key(self, ch: int):
+        """Key handling while in dashboard view."""
+        if ch in (10, 13):  # Enter — attempt to resolve or execute command
+            text = self.input_buf.strip()
+            self.input_buf  = ""
+            self.cursor_pos = 0
+            if not text:
+                return
+            # "/jobs" returns to chat view
+            if text.lower() in ("/jobs", "/chat", "/back", "/exit"):
+                self._view = "chat"
+                return
+            # "<num> <value>" resolves approval #num
+            parts = text.split(None, 1)
+            try:
+                idx = int(parts[0]) - 1
+            except (ValueError, IndexError):
+                return  # not a number — ignore
+            resolution = parts[1] if len(parts) > 1 else "approved"
+            with self._approval_lock:
+                approvals = list(self._pending_approvals)
+            if 0 <= idx < len(approvals):
+                approval = approvals[idx]
+                threading.Thread(
+                    target=self._resolve_approval,
+                    args=(approval, resolution),
+                    daemon=True,
+                ).start()
+        elif ch == 3:  # Ctrl-C — return to chat
+            self._view = "chat"
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if self.cursor_pos > 0:
+                self.input_buf  = self.input_buf[:self.cursor_pos-1] + self.input_buf[self.cursor_pos:]
+                self.cursor_pos -= 1
+        elif ch == curses.KEY_DC:
+            if self.cursor_pos < len(self.input_buf):
+                self.input_buf = self.input_buf[:self.cursor_pos] + self.input_buf[self.cursor_pos+1:]
+        elif ch == curses.KEY_LEFT:
+            self.cursor_pos = max(0, self.cursor_pos - 1)
+        elif ch == curses.KEY_RIGHT:
+            self.cursor_pos = min(len(self.input_buf), self.cursor_pos + 1)
+        elif ch in (curses.KEY_HOME, 1):
+            self.cursor_pos = 0
+        elif ch in (curses.KEY_END, 5):
+            self.cursor_pos = len(self.input_buf)
+        elif ch == 21:  # Ctrl-U
+            self.input_buf  = ""
+            self.cursor_pos = 0
+        elif 32 <= ch <= 126:
+            self.input_buf = self.input_buf[:self.cursor_pos] + chr(ch) + self.input_buf[self.cursor_pos:]
+            self.cursor_pos += 1
+
+    def _resolve_approval(self, approval: dict, resolution: str):
+        """POST resolution to gateway in a background thread."""
+        req_id  = approval.get("id", "")
+        needs   = approval.get("needs", "")
+        rtype   = approval.get("request_type", "credential")
+        # Only pass key_name to Vault for credential-type requests
+        key_name = needs if rtype == "credential" else None
+        try:
+            url = f"{GATEWAY_URL}/approvals/resolve/{req_id}"
+            gw_headers = {}
+            if GATEWAY_API_KEY:
+                gw_headers["X-API-Key"] = GATEWAY_API_KEY
+            http_post(
+                url,
+                {"resolution": resolution, "key_name": key_name},
+                headers=gw_headers,
+                timeout=10,
+            )
+        except Exception as e:
+            logging.error("Failed to resolve approval %s: %s", req_id, e)
+        finally:
+            self._redraw_needed.set()
+
     # ── Key handler ───────────────────────────────────────────────────────────
     def handle_key(self, ch: int):
+        if self._view == "dashboard":
+            self._handle_dashboard_key(ch)
+            return
         if ch in (10, 13):  # Enter
             self._submit()
         elif ch == 3:  # Ctrl-C
@@ -681,6 +800,8 @@ class SecureBotApp:
             self._cmd_cc(arg)
         elif cmd == "/haiku":
             self._cmd_haiku(arg)
+        elif cmd == "/jobs":
+            self._cmd_jobs()
         else:
             self.chat.add(f"Unknown command: {cmd}  (type /help)", curses.color_pair(C_RED))
 
@@ -884,6 +1005,7 @@ class SecureBotApp:
             "/clear             Clear chat",
             "/cc <prompt>       Delegate to Claude Code",
             "/haiku <prompt>    Ask Claude Haiku directly",
+            "/jobs              System Dashboard (jobs + approvals)",
             "/quit /exit        Exit",
             "PgUp/PgDn ↑↓      Scroll chat",
             "Ctrl-A/E           Cursor home/end",
@@ -980,6 +1102,13 @@ class SecureBotApp:
 
         threading.Thread(target=_do, daemon=True).start()
 
+    def _cmd_jobs(self):
+        """Switch to the System Dashboard view."""
+        self._view = "dashboard"
+        self.input_buf  = ""
+        self.cursor_pos = 0
+        self._redraw_needed.set()
+
     # ── Send message to gateway ───────────────────────────────────────────────
     def _send_message(self, text: str):
         if self._thinking:
@@ -1039,7 +1168,10 @@ class SecureBotApp:
     # ── Drawing ───────────────────────────────────────────────────────────────
     def redraw(self):
         try:
-            self._do_redraw()
+            if self._view == "dashboard":
+                self._do_dashboard_redraw()
+            else:
+                self._do_redraw()
             self._last_draw = time.time()
         except Exception as e:
             try:
@@ -1056,11 +1188,14 @@ class SecureBotApp:
         row = 0
 
         # ── Header ────────────────────────────────────────────────────────────
-        machine   = snap.get("machine", "local")
         hostname  = os.uname().nodename if hasattr(os, "uname") else "local"
+        with self._approval_lock:
+            n_pending = len([a for a in self._pending_approvals if a.get("status") == "pending"])
+        alert = f" [!{n_pending} APPROVALS /jobs]" if n_pending else ""
         header = (f" SecureBot CLI | {RESPONSE_MODEL} | {hostname} | "
-                  f"tone:{self.prefs.tone}|v:{self.prefs.verbosity}")
-        self._safe_addstr(row, 0, header[:w].ljust(w), curses.color_pair(C_HEADER) | curses.A_BOLD)
+                  f"tone:{self.prefs.tone}|v:{self.prefs.verbosity}{alert}")
+        header_attr = curses.color_pair(C_HEADER) | curses.A_BOLD
+        self._safe_addstr(row, 0, header[:w].ljust(w), header_attr)
         row += 1
 
         if h < 20:
@@ -1225,6 +1360,144 @@ class SecureBotApp:
         if _final_cursor:
             try:
                 self.stdscr.move(*_final_cursor)
+            except curses.error:
+                pass
+
+    # ── Dashboard renderer ────────────────────────────────────────────────────
+    def _do_dashboard_redraw(self):
+        h, w = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+
+        with self._approval_lock:
+            approvals = list(self._pending_approvals)
+            jobs_data = dict(self._jobs_status)
+
+        row = 0
+
+        # ── Header bar ────────────────────────────────────────────────────────
+        title = " SYSTEM DASHBOARD  [Ctrl-C or /jobs to return to chat]"
+        self._safe_addstr(row, 0, title[:w].ljust(w), curses.color_pair(C_HEADER) | curses.A_BOLD)
+        row += 1
+
+        # ── Background Jobs section ───────────────────────────────────────────
+        if row < h:
+            self._safe_addstr(row, 0, "─" * w, curses.color_pair(C_DIM))
+            row += 1
+        if row < h:
+            self._safe_addstr(row, 0, " BACKGROUND JOBS", curses.color_pair(C_YELLOW) | curses.A_BOLD)
+            row += 1
+
+        jobs = jobs_data.get("jobs", {})
+        watchdog_note = jobs_data.get("watchdog_note")
+        updated = jobs_data.get("updated", "")
+
+        if watchdog_note and row < h:
+            note = f"  [!] {watchdog_note}"
+            self._safe_addstr(row, 0, note[:w], curses.color_pair(C_YELLOW))
+            row += 1
+        elif not jobs and row < h:
+            self._safe_addstr(row, 0, "  No job data available (watchdog not yet run)", curses.color_pair(C_DIM))
+            row += 1
+
+        if jobs and row < h:
+            col_w = max(1, min(24, w // 4))
+            hdr = f"  {'JOB':<{col_w}}{'LAST CHECK':<20}{'STATUS':<10}DIAGNOSIS"
+            self._safe_addstr(row, 0, hdr[:w], curses.color_pair(C_YELLOW))
+            row += 1
+
+        for unit, entry in list(jobs.items()):
+            if row >= h - 4:
+                if row < h:
+                    self._safe_addstr(row, 0, f"  ... ({len(jobs)} total jobs)", curses.color_pair(C_DIM))
+                    row += 1
+                break
+            failed  = entry.get("failed", False)
+            active  = entry.get("active", False)
+            status  = "FAILED" if failed else ("OK" if active else "inactive")
+            attr    = curses.color_pair(C_RED) if failed else (
+                      curses.color_pair(C_GREEN) if active else curses.color_pair(C_DIM))
+            last_chk = (entry.get("last_check") or "")[:16]
+            diag    = ""
+            d = entry.get("diagnosis")
+            if d and failed:
+                react = d.get("react_diagnosis", "")
+                # Extract just the Thought line for compact display
+                for line in react.splitlines():
+                    if line.startswith("Thought:"):
+                        diag = line[8:].strip()[:max(1, w - 56)]
+                        break
+                if not diag:
+                    diag = react[:max(1, w - 56)]
+            col_w = max(1, min(24, w // 4))
+            unit_short = unit[:col_w]
+            line = f"  {unit_short:<{col_w}}{last_chk:<20}{status:<10}{diag}"
+            self._safe_addstr(row, 0, line[:w], attr)
+            row += 1
+
+        if updated and row < h:
+            self._safe_addstr(row, 0, f"  Updated: {updated[:19]}", curses.color_pair(C_DIM))
+            row += 1
+
+        # ── Pending Approvals section ─────────────────────────────────────────
+        if row < h:
+            self._safe_addstr(row, 0, "─" * w, curses.color_pair(C_DIM))
+            row += 1
+        if row < h:
+            hdr2 = f" PENDING APPROVALS ({len(approvals)})"
+            attr2 = curses.color_pair(C_RED) | curses.A_BOLD if approvals else curses.color_pair(C_YELLOW) | curses.A_BOLD
+            self._safe_addstr(row, 0, hdr2[:w], attr2)
+            row += 1
+
+        if not approvals and row < h:
+            self._safe_addstr(row, 0, "  No pending approvals.", curses.color_pair(C_DIM))
+            row += 1
+
+        for i, appr in enumerate(approvals):
+            if row >= h - 4:
+                break
+            idx_str  = f"[{i+1}]"
+            rationale = appr.get("rationale", "")[:max(1, w - 30)]
+            rtype     = appr.get("request_type", "credential")
+            needs     = appr.get("needs", "")
+            created   = (appr.get("created_at") or "")[:16]
+            line1 = f"  {idx_str} {rationale}"
+            line2 = f"      Created: {created} | needs: {needs} | type: {rtype}"
+            color = curses.color_pair(C_RED) if rtype == "credential" else curses.color_pair(C_YELLOW)
+            if row < h:
+                self._safe_addstr(row, 0, line1[:w], color)
+                row += 1
+            if row < h:
+                self._safe_addstr(row, 0, line2[:w], curses.color_pair(C_DIM))
+                row += 1
+
+        # ── Input line ────────────────────────────────────────────────────────
+        input_row  = max(row + 1, h - 2)
+        status_row = h - 1
+
+        if input_row < h:
+            if row < input_row:
+                self._safe_addstr(row, 0, "─" * w, curses.color_pair(C_DIM))
+
+            prompt = " [<#> <value> to resolve | /jobs to exit] "
+            avail  = max(0, w - len(prompt) - 1)
+            buf    = self.input_buf
+            view_start = 0
+            if self.cursor_pos >= avail:
+                view_start = self.cursor_pos - avail + 1
+            view_buf   = buf[view_start:view_start + avail]
+            cursor_col = len(prompt) + (self.cursor_pos - view_start)
+
+            input_line = prompt + view_buf
+            self._safe_addstr(input_row, 0, input_line[:w].ljust(w), curses.color_pair(C_CYAN))
+            cursor_col = min(cursor_col, w - 1)
+
+        if status_row < h and status_row != input_row:
+            self._safe_addstr(status_row, 0, " " * w, curses.color_pair(C_DIM))
+
+        self.stdscr.refresh()
+        if input_row < h:
+            try:
+                self.stdscr.move(input_row, min(cursor_col, w - 1))
             except curses.error:
                 pass
 

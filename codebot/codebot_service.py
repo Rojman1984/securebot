@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -134,6 +135,81 @@ def _classify_coding_mode(intent: str) -> str:
         return "system_bash"
 
 
+# ── Model fallback helpers ────────────────────────────────────────────────────
+
+# Patterns that indicate the Anthropic API returned a quota or payment error.
+_ANTHROPIC_QUOTA_PATTERNS = [
+    "429", "rate_limit_error", "rateLimitError",
+    "402", "payment_required",
+    "overloaded_error", "overloaded",
+]
+
+
+def _detect_anthropic_quota_error(text: str) -> bool:
+    """Return True if Pi CLI output contains an Anthropic quota/rate-limit error."""
+    text_lower = text.lower()
+    return any(p.lower() in text_lower for p in _ANTHROPIC_QUOTA_PATTERNS)
+
+
+def _build_fallback_pi_config(fallback_model: str) -> str:
+    """
+    Create a temporary pi_config.json with the fallback model substituted in.
+    Returns the path to the temp file (caller must unlink it).
+    """
+    try:
+        with open(PI_CONFIG) as f:
+            config = json.load(f)
+    except Exception:
+        config = {}
+    config["model"] = fallback_model
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, dir="/tmp", prefix="pi_fallback_"
+    )
+    json.dump(config, tmp)
+    tmp.close()
+    logger.info("Fallback pi_config written: %s (model=%s)", tmp.name, fallback_model)
+    return tmp.name
+
+
+def _post_fallback_notification(original_model: str, fallback_model: str) -> None:
+    """
+    Notify the Gateway that a model fallback occurred (best-effort, fire-and-forget).
+    Creates an approval request of type 'notification' so it appears in the CLI dashboard.
+    """
+    path = "/approvals/request"
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(8)
+    message = f"{SERVICE_ID}:{ts}:{nonce}:POST:{path}"
+    sig = "sha256=" + hmac_lib.new(
+        SERVICE_SECRET.encode(), message.encode(), hashlib.sha256
+    ).hexdigest()
+    payload = json.dumps({
+        "rationale": (
+            f"Model fallback occurred: {original_model} → {fallback_model}. "
+            "Anthropic API returned a quota or rate-limit error."
+        ),
+        "needs": "notification",
+        "request_type": "notification",
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            f"{GATEWAY_URL}{path}",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Service-ID": SERVICE_ID,
+                "X-Timestamp": ts,
+                "X-Nonce": nonce,
+                "X-Signature": sig,
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+        logger.info("Fallback notification posted to gateway")
+    except Exception as e:
+        logger.warning("Could not post fallback notification: %s", e)
+
+
 # ── Pi CLI invocation ─────────────────────────────────────────────────────────
 
 def _build_pi_task(intent: str, execution_mode: str) -> str:
@@ -156,37 +232,76 @@ def _invoke_pi_cli(task: str, timeout: int = 120) -> dict:
     """
     Run Pi CLI non-interactively with the given task string.
     Returns {"success": bool, "output": str, "skill_name": str|None}.
+
+    Error interceptor: if Pi CLI exits non-zero and the output contains an
+    Anthropic quota/rate-limit error (HTTP 429 or 402), automatically:
+    1. Build a fallback pi_config pointing to FALLBACK_MODEL (default: ollama/llama3.2:3b).
+    2. Post a notification to the Gateway approval queue.
+    3. Retry once with the fallback config.
     """
+    fallback_model = os.getenv("FALLBACK_MODEL", "ollama/llama3.2:3b")
+    fallback_config_path: Optional[str] = None
+
+    def _run(config_path: str) -> dict:
+        try:
+            result = subprocess.run(
+                ["pi", "--config", config_path, "--task", task],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(WORKSPACE),
+                env={**os.environ, "SKILLS_DIR": SKILLS_DIR, "GATEWAY_URL": GATEWAY_URL},
+            )
+            return {
+                "returncode": result.returncode,
+                "output": result.stdout.strip(),
+                "err": result.stderr.strip(),
+            }
+        except subprocess.TimeoutExpired:
+            return {"returncode": -1, "output": "", "err": "Pi CLI timed out"}
+        except FileNotFoundError:
+            return {"returncode": -1, "output": "", "err": "pi command not found"}
+        except Exception as exc:
+            return {"returncode": -1, "output": "", "err": str(exc)}
+
     try:
-        result = subprocess.run(
-            ["pi", "--config", PI_CONFIG, "--task", task],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(WORKSPACE),
-            env={**os.environ, "SKILLS_DIR": SKILLS_DIR, "GATEWAY_URL": GATEWAY_URL},
-        )
-        output = result.stdout.strip()
-        err = result.stderr.strip()
+        # ── Attempt 1: primary config ─────────────────────────────────────────
+        r = _run(PI_CONFIG)
+        if r["returncode"] == 0:
+            skill_name = _extract_skill_name_from_output(r["output"])
+            logger.info("Pi CLI completed. skill_name=%s", skill_name)
+            return {"success": True, "output": r["output"], "skill_name": skill_name}
 
-        if result.returncode != 0:
-            logger.error("Pi CLI exited %d: %s", result.returncode, err[:200])
-            return {"success": False, "output": err or output, "skill_name": None}
+        combined = r["err"] + " " + r["output"]
 
-        # Extract skill name from the output — Pi is instructed to print only it
-        skill_name = _extract_skill_name_from_output(output)
-        logger.info("Pi CLI completed. skill_name=%s", skill_name)
-        return {"success": True, "output": output, "skill_name": skill_name}
+        # ── Error interceptor: quota/rate-limit → fallback model ──────────────
+        if _detect_anthropic_quota_error(combined):
+            logger.warning(
+                "Anthropic quota error detected — switching to fallback model '%s'",
+                fallback_model,
+            )
+            fallback_config_path = _build_fallback_pi_config(fallback_model)
+            _post_fallback_notification("primary", fallback_model)
 
-    except subprocess.TimeoutExpired:
-        logger.error("Pi CLI timed out after %ds", timeout)
-        return {"success": False, "output": "Pi CLI timed out", "skill_name": None}
-    except FileNotFoundError:
-        logger.error("Pi CLI not found — is pi-coding-agent installed?")
-        return {"success": False, "output": "pi command not found", "skill_name": None}
-    except Exception as e:
-        logger.error("Pi CLI error: %s", e)
-        return {"success": False, "output": str(e), "skill_name": None}
+            # ── Attempt 2: fallback config ────────────────────────────────────
+            r2 = _run(fallback_config_path)
+            if r2["returncode"] == 0:
+                skill_name = _extract_skill_name_from_output(r2["output"])
+                logger.info("Pi CLI completed (fallback). skill_name=%s", skill_name)
+                return {"success": True, "output": r2["output"], "skill_name": skill_name}
+            err_msg = r2["err"] or r2["output"] or "Pi CLI fallback returned no output"
+        else:
+            err_msg = r["err"] or r["output"] or "Pi CLI returned no output"
+
+        logger.error("Pi CLI failed: %s", err_msg[:200])
+        return {"success": False, "output": err_msg, "skill_name": None}
+
+    finally:
+        if fallback_config_path:
+            try:
+                os.unlink(fallback_config_path)
+            except Exception:
+                pass
 
 
 def _extract_skill_name_from_output(output: str) -> Optional[str]:

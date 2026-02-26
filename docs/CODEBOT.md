@@ -38,6 +38,7 @@ The orchestrator calls CodeBot first (`codebot_generate_skill()`). Haiku direct 
 | `codebot/skill_router.py` | Classifies intent as `system_bash` or `python_api_or_data` |
 | `codebot/pi_config.json` | Pi coding agent configuration |
 | `codebot/tools/` | Pi CLI tool definitions (do not modify) |
+| `codebot/tools/tool_request_approval.py` | HITL approval tool — see Model Fallback section above |
 
 ---
 
@@ -64,6 +65,10 @@ draft (Pi coding agent)
 lint (tool_lint_bash.sh / tool_lint_python.sh)
     ↓
 sandbox test (tool_run_sandbox_test.py → gateway /internal/test-skill)
+    ↓ (needs secret or critical change?)
+request_approval → poll status (5s interval, 5min max)
+    ↓ (resolved by operator)
+resume workflow
     ↓
 validate YAML (tool_validate_yaml.py — 5-field check)
     ↓
@@ -71,6 +76,8 @@ commit (tool_commit_skill.sh — path-traversal-safe)
 ```
 
 **Never commits on failures.** Any step failure aborts the pipeline and returns an error to the orchestrator.
+
+Pi must STOP and call `request_approval` when it lacks credentials or is about to make a system-critical change. Execution does not continue until the operator resolves the request via the CLI dashboard or API.
 
 ### Tool Descriptions
 
@@ -81,6 +88,7 @@ commit (tool_commit_skill.sh — path-traversal-safe)
 | `tool_run_sandbox_test.py` | Python | HMAC-signed POST to gateway `/internal/test-skill` |
 | `tool_validate_yaml.py` | Python | Validates SKILL.md frontmatter has all 5 required fields |
 | `tool_commit_skill.sh` | Bash | Writes SKILL.md to `skills/` with path-traversal protection |
+| `tool_request_approval.py` | Python | HMAC-signed POST to `/approvals/request`; polls `/approvals/status/{id}` every 5s, up to 5 minutes |
 
 ---
 
@@ -106,6 +114,24 @@ All test execution is routed through the gateway's `/internal/test-skill` endpoi
 - Explicit keywords from `.env` `REDACT_WORDS`
 
 CodeBot itself also calls `_sanitize_for_cloud()` before invoking Haiku for any complex skill logic.
+
+---
+
+## Model Fallback (Error Interceptor)
+
+`codebot_service.py` watches for Anthropic API quota errors:
+- HTTP 429 (rate limit)
+- HTTP 402 (payment required)
+- "overloaded" error patterns
+
+On quota error:
+1. Builds a temporary Pi config pointing to `FALLBACK_MODEL` env var
+2. Posts a notification to the gateway approval queue
+3. Retries the skill generation once with the fallback model
+4. Cleans up temp config in a `finally` block
+
+Set `FALLBACK_MODEL` in `.env` to a local Ollama model or OpenRouter endpoint.
+If unset, fallback silently degrades to the Haiku direct path.
 
 ---
 

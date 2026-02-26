@@ -249,6 +249,27 @@ model: llama3.2:1b
 - Privacy-sensitive tasks
 - Cost optimization (no API calls)
 
+### 4. python (Structured Data Tasks)
+
+Executes a Python script block for tasks requiring structured output, data processing, or file reading where Ollama wrapping is undesirable.
+
+```yaml
+execution_mode: python
+```
+
+**Use Cases:**
+- Cost reporting (reads cost_logs.json, prints table)
+- Log analysis
+- Any task where stdout should be returned verbatim
+
+**Execution:**
+1. Extract ` ```python ` block from SKILL.md
+2. Write to temp file, chmod 644
+3. Run via `sudo -u securebot-scripts python3`
+4. stdout returned directly (no Ollama wrap)
+
+**Security:** Same sandboxing as bash — runs as `securebot-scripts` user.
+
 ---
 
 ## Creating Your First Skill
@@ -536,6 +557,16 @@ skill_content = skill_content.replace('${CLAUDE_SESSION_ID}', session_id)
 ---
 
 ## Skill Matching System
+
+> **Important (Architecture Note):** The scoring algorithm described below applies
+> to the `/skills` listing endpoint only. **Query routing does NOT use this
+> algorithm.** Live routing uses:
+> 1. GLiClass zero-shot classifier (determines intent: search/task/knowledge/chat/action)
+> 2. For `action` intent only: `SkillRegistry.find_by_trigger()` — exact substring
+>    match against the `triggers` array in SKILL.md frontmatter
+>
+> If no trigger matches, the query escalates to CodeBot for skill generation.
+> The legacy SkillMatcher class remains in orchestrator.py for skill browsing only.
 
 Understanding how SecureBot matches user queries to skills helps you write better skill descriptions.
 

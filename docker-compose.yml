@@ -50,6 +50,8 @@ services:
       - ./skills:/app/skills
       - ./memory:/memory
       - ~/.cache/huggingface:/app/.cache/huggingface
+      - /run/systemd/private:/run/systemd/private:ro
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
     networks:
       - securebot
     ports:

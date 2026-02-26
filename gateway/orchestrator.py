@@ -175,6 +175,14 @@ def _extract_bash_script(skill_content: str) -> str:
     return ""
 
 
+def _extract_python_script(skill_content: str) -> str:
+    """Extract python script block from SKILL.md content."""
+    match = re.search(r'```python\n(.*?)```', skill_content, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
 async def execute_skill(
     skill: dict,
     user_query: str,
@@ -252,6 +260,49 @@ async def execute_skill(
                 return response.json().get("response", script_output)
         except Exception as e:
             logger.error("Ollama wrap failed: %s — returning raw output", e)
+            return script_output
+
+    elif execution_mode == "python":
+        script_content = _extract_python_script(skill.get("_content", ""))
+        if not script_content:
+            return "Skill Python script not found."
+
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', delete=False
+        ) as f:
+            f.write(script_content)
+            script_path = f.name
+        os.chmod(script_path, 0o644)
+
+        try:
+            result = subprocess.run(
+                ['sudo', '-u', 'securebot-scripts', 'python3', script_path],
+                capture_output=True,
+                timeout=skill.get("timeout", 30),
+                text=True
+            )
+            script_output = result.stdout.strip()
+            if not script_output:
+                script_output = result.stderr.strip() or "No output."
+        except subprocess.TimeoutExpired:
+            script_output = "Python script timed out."
+        finally:
+            os.unlink(script_path)
+
+        wrap_prompt = (
+            f"The user asked: '{user_query}'\n"
+            f"The system returned:\n{script_output}\n"
+            f"Respond naturally using this information."
+        )
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    f"{ollama_url}/api/generate",
+                    json={"model": RESPONSE_MODEL, "prompt": wrap_prompt, "stream": False}
+                )
+                return response.json().get("response", script_output)
+        except Exception as e:
+            logger.error("Ollama wrap failed for python skill: %s — returning raw output", e)
             return script_output
 
     elif execution_mode == "ollama":
@@ -497,15 +548,23 @@ async def haiku_generate_skill(
         )
         skill_content = message.content[0].text
 
-        # Cost tracking (Haiku: $0.80/M input, $4.00/M output)
-        cost = (message.usage.input_tokens * 0.0000008) + \
-               (message.usage.output_tokens * 0.000004)
+        # Cost tracking (Haiku 4.5: $1.00/M input, $5.00/M output)
+        cost = (message.usage.input_tokens * 0.000001) + \
+               (message.usage.output_tokens * 0.000005)
         logger.info(
             "COST_EVENT: skill_creation | model=%s | tokens=%d/%d | cost=$%.4f",
             HAIKU_MODEL,
             message.usage.input_tokens,
             message.usage.output_tokens,
             cost
+        )
+        _append_cost_log(
+            session_id="haiku_fallback",
+            task_name=f"skill_creation:{sanitized[:60]}",
+            model=HAIKU_MODEL,
+            input_tokens=message.usage.input_tokens,
+            output_tokens=message.usage.output_tokens,
+            cost=cost,
         )
 
         result = _validate_and_save_skill(skill_content, skills_dir)
@@ -515,6 +574,44 @@ async def haiku_generate_skill(
     except Exception as e:
         logger.error("Haiku skill generation failed: %s", e)
         return {"success": False, "error": str(e), "cost": 0.0}
+
+
+def _append_cost_log(
+    session_id: str,
+    task_name: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost: float,
+) -> None:
+    """
+    Append a cost entry to /memory/cost_logs.json.
+    Structure: timestamp, session_id, task_name, input_tokens, output_tokens, total_cost.
+    """
+    cost_log_path = Path(os.getenv("MEMORY_DIR", "/memory")) / "cost_logs.json"
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "session_id": session_id,
+        "task_name": task_name,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_cost": round(cost, 6),
+    }
+    try:
+        logs: list = []
+        if cost_log_path.exists():
+            try:
+                logs = json.loads(cost_log_path.read_text(encoding="utf-8"))
+                if not isinstance(logs, list):
+                    logs = []
+            except Exception:
+                logs = []
+        logs.append(entry)
+        cost_log_path.parent.mkdir(parents=True, exist_ok=True)
+        cost_log_path.write_text(json.dumps(logs, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error("Failed to write cost_logs.json: %s", e)
 
 
 def _sanitize_for_cloud(text: str) -> str:

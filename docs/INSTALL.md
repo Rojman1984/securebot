@@ -49,14 +49,14 @@ SecureBot works on ANY hardware - choose your model based on your machine:
 
 | Hardware | Example Devices | Recommended Model | Response Time |
 |----------|-----------------|-------------------|---------------|
-| 8GB RAM | Budget laptops, old PCs | phi4-mini:3.8b | ~50 seconds |
+| 8GB RAM | Budget laptops, old PCs | llama3.2:3b | ~50 seconds |
 | 16GB RAM | Mid-range laptops | llama3:8b | ~30 seconds |
 
 **Cost:** Hardware you already own + $0/month
 
 ```bash
 # Budget setup
-ollama pull phi4-mini:3.8b
+ollama pull llama3.2:3b
 ```
 
 ---
@@ -272,7 +272,7 @@ ollama serve
 
 ```bash
 # Budget (8GB RAM) - Works on ANY machine
-ollama pull phi4-mini:3.8b
+ollama pull llama3.2:3b
 
 # Mid-range (16GB RAM)
 ollama pull llama3:8b
@@ -288,7 +288,7 @@ ollama list
 ```
 
 **Model sizes:**
-- phi4-mini:3.8b → ~2.3GB download
+- llama3.2:3b → ~2.3GB download
 - llama3:8b → ~4.7GB download
 - llama3:70b → ~40GB download
 - llama3:405b → ~231GB download
@@ -365,7 +365,7 @@ Edit `docker-compose.yml` to match the model you pulled:
 nano docker-compose.yml
 
 # Find line 31:
-# OLLAMA_MODEL=phi4-mini:3.8b
+# OLLAMA_MODEL=llama3.2:3b
 
 # Change to your model:
 # OLLAMA_MODEL=llama3:8b
@@ -426,11 +426,14 @@ curl http://localhost:8200/health
 # Expected output:
 # {"status":"healthy","version":"1.0.0","secrets_loaded":2,"search_providers":["google","tavily","duckduckgo"],...}
 
+# CodeBot health
+curl http://localhost:8500/health
+
 # Ollama health
 curl http://localhost:11434/api/tags
 
 # Expected output:
-# {"models":[{"name":"phi4-mini:3.8b",...}]}
+# {"models":[{"name":"llama3.2:3b",...}]}
 ```
 
 ---
@@ -449,7 +452,7 @@ curl -X POST http://localhost:8080/message \
 ```
 
 **Expected response time:**
-- Budget hardware (phi4-mini): 30-50 seconds
+- Budget hardware (llama3.2:3b): 30-50 seconds
 - Mid-range (llama3:8b): 15-30 seconds
 - Mac Mini M4 (llama3:70b): 3-5 seconds
 - GPU server: <1 second
@@ -579,11 +582,11 @@ docker-compose restart
 **Solution:**
 ```bash
 # 1. Use a smaller model
-ollama pull phi4-mini:3.8b
+ollama pull llama3.2:3b
 
 # 2. Update docker-compose.yml
 nano docker-compose.yml
-# Change: OLLAMA_MODEL=phi4-mini:3.8b
+# Change: OLLAMA_MODEL=llama3.2:3b
 
 # 3. Restart
 docker-compose restart gateway
@@ -867,7 +870,7 @@ curl http://localhost:8080/health
 
 ```bash
 # Re-pull model to get latest version
-ollama pull phi4-mini:3.8b
+ollama pull llama3.2:3b
 ollama pull llama3:8b
 ollama pull llama3:70b
 
